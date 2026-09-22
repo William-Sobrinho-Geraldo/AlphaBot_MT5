@@ -1,6 +1,9 @@
-venv/
+# Credenciais
 .env
-__pycache__/
-*.pyc
-*.pyo
-.pytest_cache/
+
+# Artefatos de compilação Windows
+Thumbs.db
+Desktop.ini
+
+# VS Code
+.vscode/
