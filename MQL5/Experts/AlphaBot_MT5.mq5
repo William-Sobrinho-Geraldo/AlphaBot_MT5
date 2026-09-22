@@ -7,6 +7,8 @@
 #property link      "https://www.mql5.com"
 #property version   "1.00"
 
+#include <Trade\Trade.mqh>
+
 //+------------------------------------------------------------------+
 //| Parâmetros Operacionais - Interface nativa do MT5                |
 //+------------------------------------------------------------------+
@@ -21,11 +23,15 @@ input int    InpAdxPeriod       = 14;   // Período do ADX
 input double InpAdxMinimo       = 25.0; // ADX mínimo p/ tendência forte
 input double InpPinBarRatio     = 2.5;  // Corpo x Pavio (Pin Bar)
 
+input group "=== AlphaBot - Execução de Ordens ==="
+input long   InpMagicNumber    = 123456; // Magic Number do robô
+
 //+------------------------------------------------------------------+
-//| Handles globais dos indicadores                                  |
+//| Handles globais dos indicadores e objeto de trade                |
 //+------------------------------------------------------------------+
-int g_handle_sma = INVALID_HANDLE;
-int g_handle_adx = INVALID_HANDLE;
+int    g_handle_sma = INVALID_HANDLE;
+int    g_handle_adx = INVALID_HANDLE;
+CTrade trade;
 
 //+------------------------------------------------------------------+
 //| Cria e valida os handles dos indicadores no timeframe atual.     |
@@ -81,6 +87,16 @@ int OnInit()
       Alert("AlphaBot - ERRO: falha ao inicializar os indicadores. Robô NÃO carregado.");
       return(INIT_FAILED);
      }
+
+//--- Configuração do objeto de execução (Requisito 3)
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(10);
+
+   if(!trade.SetTypeFillingBySymbol(_Symbol))
+      Print("AlphaBot - AVISO: não foi possível definir o modo de preenchimento (filling) para ",
+            _Symbol, " (erro ", GetLastError(), ").");
+
+   Print("AlphaBot - Execução configurada: MagicNumber=", InpMagicNumber, ".");
 
    Print("AlphaBot - Inicializado com sucesso: conta em modo HEDGE.");
    return(INIT_SUCCEEDED);
@@ -210,14 +226,47 @@ bool CheckBuySignal()
   }
 
 //+------------------------------------------------------------------+
+//| Verifica se já existe posição aberta deste EA (símbolo + magic). |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+  {
+   for(int i=PositionsTotal()-1; i>=0; i--)
+     {
+      ulong ticket=PositionGetTicket(i);
+      if(ticket==0)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL)==_Symbol &&
+         (long)PositionGetInteger(POSITION_MAGIC)==InpMagicNumber)
+         return(true);
+     }
+
+   return(false);
+  }
+
+//+------------------------------------------------------------------+
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick()
   {
-//--- Módulo de Sinais (Requisito 2)
-   if(CheckBuySignal())
+//--- Módulo de Sinais + trava de posição única (Requisitos 2 e 3)
+//--- Só avalia o sinal se NÃO houver posição aberta deste EA.
+   if(!HasOpenPosition() && CheckBuySignal())
      {
       Print("AlphaBot - Sinal de Compra validado (SMA + ADX + Price Action)!");
+
+      //--- Execução de ordem a mercado (Requisito 3)
+      if(trade.Buy(InpLoteInicial, _Symbol, 0, 0, 0, "AlphaBot Entry"))
+        {
+         Print("AlphaBot - Ordem de COMPRA executada com sucesso. Ticket: ",
+               trade.ResultOrder(), " | Preço: ", trade.ResultPrice());
+        }
+      else
+        {
+         Print("AlphaBot - ERRO ao enviar ordem de COMPRA. Retcode: ",
+               trade.ResultRetcode(), " (", trade.ResultRetcodeDescription(),
+               ") | Erro: ", GetLastError());
+        }
      }
 
 //--- Demais lógicas (Gradiente Linear Duplo, Offsetting e HEDGE)
