@@ -7,3 +7,8 @@ Desktop.ini
 
 # VS Code
 .vscode/
+
+# MetaTrader - compilados e logs
+*.ex5
+*.ex4
+*.log
