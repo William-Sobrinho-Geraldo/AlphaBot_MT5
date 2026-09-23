@@ -14,6 +14,11 @@
 #include <Trade\Trade.mqh>
 
 //+------------------------------------------------------------------+
+//| Prefixo dos objetos gráficos do Motor Fimathe                    |
+//+------------------------------------------------------------------+
+#define FIMATHE_PREFIX "Fimathe_Obj_"
+
+//+------------------------------------------------------------------+
 //| Ação a tomar quando surge um sinal oposto à posição aberta       |
 //+------------------------------------------------------------------+
 enum ENUM_OPPOSITE_ACTION
@@ -21,6 +26,25 @@ enum ENUM_OPPOSITE_ACTION
    ACTION_DO_NOTHING        = 0, // Ignora o sinal oposto
    ACTION_CLOSE_ONLY        = 1, // Fecha a posição atual
    ACTION_CLOSE_AND_REVERSE = 2  // Fecha e reverte a posição
+  };
+
+//+------------------------------------------------------------------+
+//| Estratégia responsável por gerar o gatilho da primeira ordem      |
+//+------------------------------------------------------------------+
+enum ENUM_ENTRY_SIGNAL_TYPE
+  {
+   SIGNAL_CANDLE_PATTERNS, // Padrões de Candle (Engolfo, Martelo)
+   SIGNAL_FIMATHE,         // Metodologia Fimathe (Rompimento CR + ZN)
+   SIGNAL_TRAP             // Armadilha de Liquidez / Wyckoff (Fake Breakout + Volume)
+  };
+
+//+------------------------------------------------------------------+
+//| Modo de cálculo da amplitude do canal Fimathe                    |
+//+------------------------------------------------------------------+
+enum ENUM_FIMATHE_CALC
+  {
+   FIMATHE_USE_SWING_BARS, // Estrutura de Velas (Pernada / Recuo)
+   FIMATHE_USE_ATR         // ATR (Amplitude do Canal)
   };
 
 //+------------------------------------------------------------------+
@@ -49,6 +73,22 @@ input int    InpMaMacroPeriod        = 200;       // Período da média macro
 input ENUM_MA_METHOD InpMaMacroMethod = MODE_EMA; // Método (EMA ou SMA)
 input ENUM_APPLIED_PRICE InpMaMacroAppliedPrice = PRICE_CLOSE; // Preço aplicado
 
+input group "=== AlphaBot - Motor de Sinal de Entrada ==="
+input ENUM_ENTRY_SIGNAL_TYPE InpEntrySignalType = SIGNAL_FIMATHE; // Tipo de Sinal de Entrada
+input int    InpFimatheATRPeriod    = 14;   // Fimathe: Período do ATR (Amplitude do Canal)
+input double InpFimatheATRMult      = 1.5;  // Fimathe: Multiplicador do ATR (Altura do CR/ZN)
+input ENUM_FIMATHE_CALC InpFimatheCalcType = FIMATHE_USE_SWING_BARS; // Fimathe: Modo de Cálculo do Canal
+input int    InpFimatheSwingBars    = 10;   // Fimathe: Qtd de Velas da Pernada/Recuo (Se usar Swing)
+input bool   InpUseSubcycleProtect  = true; // Fimathe: Breakeven no 1º Subciclo (1 Canal)
+input bool   InpAllowFimatheReversal = true; // Fimathe: Virar a Mão (Reversão Automática ao romper ZN)
+
+input group "=== AlphaBot - Armadilha de Liquidez (Wyckoff) ==="
+input int    InpTrapLookback        = 20;   // Armadilha: Velas para buscar Topo/Fundo (Suporte/Resistência)
+input double InpTrapVolMultiplier   = 1.5;  // Armadilha: Multiplicador de Volume de Absorção (vs Média)
+input int    InpTrapVolMAPeriod     = 20;   // Armadilha: Período da Média Móvel de Volume
+input double InpTrapRiskReward      = 2.0;  // Armadilha: Relação Risco x Retorno (TP / SL)
+input double InpTrapStopBufferPips  = 2.0;  // Armadilha: Folga de Stop (Pips) além do Pavio
+
 input group "=== AlphaBot - Execução de Ordens ==="
 input long   InpMagicNumber    = 123456; // Magic Number
 input ENUM_OPPOSITE_ACTION InpOppositeAction = ACTION_CLOSE_AND_REVERSE; // Ação em sinal oposto
@@ -58,6 +98,11 @@ input bool   InpEnableGL  = true;   // Ativar Gradiente Linear?
 input int    InpLevelsSL  = 4;      // Número de Níveis entre Entrada e Stop Loss
 input int    InpLevelsTP  = 4;      // Número de Níveis entre Entrada e Take Profit
 input long   InpMagicGL   = 654321; // Magic Number exclusivo das posições do Gradiente
+
+input group "=== AlphaBot - Piramidagem (Gradiente Positivo) ==="
+input bool   InpEnablePositivePyramid = true; // Ativar Piramidagem no Gradiente Positivo
+input double InpPositiveLotBase       = 0.02; // Volume total na abertura (Níveis Positivos)
+input double InpPartialCloseVolume    = 0.01; // Volume a ser fechado no alvo (Parcial)
 
 input group "=== AlphaBot - Grid Bidirecional (Hedge) ==="
 input bool   InpBidirectionalGrid  = false; // Ativar Grid Bidirecional (Compra + Venda simultâneas)
@@ -82,10 +127,35 @@ enum ENUM_ALPHA_SIGNAL
 CTrade trade;
 
 int    g_handle_ma_macro = INVALID_HANDLE; // Handle da Média Móvel Macro
+int    g_handle_atr      = INVALID_HANDLE; // Handle do ATR do Motor Fimathe
 
 string g_signalPadrao = ""; // Nome do padrão que gerou o último sinal
 
 bool   g_hedgeAtivo = false; // Sessão de Hedge Bidirecional iniciada? (mantém as 2 grelhas vivas)
+
+//--- Estado do Motor Fimathe (proteção de subciclo / Breakeven)
+bool   g_entradaFimathe       = false; // A posição-âncora atual foi gerada pela Fimathe?
+bool   g_fimatheBEFeito       = false; // O Breakeven do 1º subciclo já foi aplicado?
+ulong  g_fimatheAnchorTicket  = 0;     // Ticket da posição-âncora gerada pela Fimathe
+double g_fimatheChannelHeight = 0.0;   // Altura do canal (em preço) do sinal Fimathe vigente
+
+//--- Estado da visualização gráfica dos canais Fimathe
+bool   g_fimatheGraficoAtivo  = false; // Há linhas do Fimathe desenhadas no gráfico?
+
+//--- Canais Fimathe ESTÁTICOS (fixados até ocorrer rompimento + ordem aberta)
+double g_fimatheCRTop           = 0.0; // Borda superior do Canal de Referência
+double g_fimatheCRBottom        = 0.0; // Borda inferior do CR / Divisória CR-ZN
+double g_fimatheZNBottom        = 0.0; // Borda inferior da Zona Neutra (tendência de ALTA)
+double g_fimatheZNTop           = 0.0; // Borda superior da Zona Neutra (tendência de BAIXA)
+bool   g_fimatheCanalAlta       = true;// Orientação do canal: true=ALTA (ZN abaixo), false=BAIXA (ZN acima)
+bool   g_fimatheCanaisDefinidos = false; // Os canais já foram fixados neste ciclo?
+bool   g_fimatheTinhaPosicao    = false; // O ciclo chegou a ter posição ativa? (transição)
+datetime g_fimatheUltimaBarraLog = 0;    // Anti-spam do log de aguardo (1x por candle)
+
+//--- Estado do Motor Armadilha de Liquidez / Wyckoff
+bool   g_trapAtivo               = false; // O sinal pendente é da Armadilha?
+double g_trapStopLoss            = 0.0;   // Stop Loss calculado pelo pavio (armadilha)
+datetime g_trapUltimaBarraAvaliada = 0;   // Controle: avalia apenas 1x por candle fechado
 
 //+------------------------------------------------------------------+
 //| Estado de uma "perna" do Gradiente Linear (Grade Virtual).        |
@@ -108,6 +178,8 @@ public:
    double ultimaMetrica;  // Última "métrica favorável" observada
    bool   nivelAberto[];  // Estado por nível: há posição aberta?
    ulong  nivelTicket[];  // Ticket associado a cada nível da grade
+   bool   nivelPositivo[];// Nível aberto como reentrada do Gradiente Positivo (piramidagem)?
+   bool   nivelParcial[]; // Fechamento parcial (Virtual TP) já executado neste nível?
    datetime ultimoReseed; // Controle anti-spam das tentativas de re-seed
    datetime ultimoLog;    // Controle de throttling dos logs de depuração
 
@@ -139,6 +211,24 @@ bool InitMediaMacro()
    Print("AlphaBot - Média Macro inicializada (período=", InpMaMacroPeriod,
          " | método=", EnumToString(InpMaMacroMethod),
          " | preço=", EnumToString(InpMaMacroAppliedPrice), ").");
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Cria e valida o handle do ATR usado pelo Motor Fimathe.           |
+//+------------------------------------------------------------------+
+bool InitFimatheATR()
+  {
+   g_handle_atr=iATR(_Symbol, PERIOD_CURRENT, InpFimatheATRPeriod);
+   if(g_handle_atr==INVALID_HANDLE)
+     {
+      Print("AlphaBot FIMATHE - ERRO: falha ao criar handle do ATR ",
+            InpFimatheATRPeriod, " (erro ", GetLastError(), ").");
+      return(false);
+     }
+
+   Print("AlphaBot FIMATHE - ATR inicializado (período=", InpFimatheATRPeriod,
+         " | multiplicador=", DoubleToString(InpFimatheATRMult, 2), ").");
    return(true);
   }
 
@@ -197,6 +287,21 @@ int OnInit()
       return(INIT_FAILED);
      }
 
+//--- Validação dos parâmetros da Piramidagem do Gradiente Positivo
+   if(InpEnablePositivePyramid)
+     {
+      if(InpPositiveLotBase <= 0.0 || InpPartialCloseVolume <= 0.0 ||
+         InpPartialCloseVolume >= InpPositiveLotBase)
+        {
+         Alert("AlphaBot - ERRO: parâmetros inválidos da Piramidagem do Gradiente Positivo. ",
+               "Exige InpPositiveLotBase > InpPartialCloseVolume > 0. Robô NÃO carregado.");
+         Print("AlphaBot - OnInit abortado: Piramidagem inválida (lote base=",
+               DoubleToString(InpPositiveLotBase, 2), " | parcial=",
+               DoubleToString(InpPartialCloseVolume, 2), ").");
+         return(INIT_FAILED);
+        }
+     }
+
 //--- Criação e validação do handle da Média Móvel Macro
    if(!InitMediaMacro())
      {
@@ -204,9 +309,69 @@ int OnInit()
       return(INIT_FAILED);
      }
 
+//--- Validação dos parâmetros do Motor de Sinal Fimathe
+   if(InpEntrySignalType == SIGNAL_FIMATHE)
+     {
+      if(InpFimatheCalcType == FIMATHE_USE_ATR)
+        {
+         if(InpFimatheATRPeriod <= 0 || InpFimatheATRMult <= 0.0)
+           {
+            Alert("AlphaBot - ERRO: parâmetros inválidos do Motor Fimathe (modo ATR). ",
+                  "Exige InpFimatheATRPeriod > 0 e InpFimatheATRMult > 0. Robô NÃO carregado.");
+            Print("AlphaBot - OnInit abortado: Fimathe ATR inválida (ATR=",
+                  InpFimatheATRPeriod, " | mult=",
+                  DoubleToString(InpFimatheATRMult, 2), ").");
+            return(INIT_FAILED);
+           }
+
+         //--- Criação e validação do handle do ATR (apenas no modo ATR)
+         if(!InitFimatheATR())
+           {
+            Alert("AlphaBot - ERRO: falha ao inicializar o ATR do Motor Fimathe. Robô NÃO carregado.");
+            return(INIT_FAILED);
+           }
+        }
+      else
+        {
+         if(InpFimatheSwingBars < 2)
+           {
+            Alert("AlphaBot - ERRO: parâmetros inválidos do Motor Fimathe (modo Swing). ",
+                  "Exige InpFimatheSwingBars >= 2. Robô NÃO carregado.");
+            Print("AlphaBot - OnInit abortado: Fimathe Swing inválida (SwingBars=",
+                  InpFimatheSwingBars, ").");
+            return(INIT_FAILED);
+           }
+        }
+     }
+
+//--- Validação dos parâmetros da Armadilha de Liquidez / Wyckoff
+   if(InpEntrySignalType == SIGNAL_TRAP)
+     {
+      if(InpTrapLookback < 2 || InpTrapVolMAPeriod < 2 ||
+         InpTrapVolMultiplier <= 0.0 || InpTrapRiskReward <= 0.0 ||
+         InpTrapStopBufferPips < 0.0)
+        {
+         Alert("AlphaBot - ERRO: parâmetros inválidos da Armadilha de Liquidez. ",
+               "Exige InpTrapLookback >= 2, InpTrapVolMAPeriod >= 2, ",
+               "InpTrapVolMultiplier > 0, InpTrapRiskReward > 0 e InpTrapStopBufferPips >= 0. ",
+               "Robô NÃO carregado.");
+         Print("AlphaBot - OnInit abortado: Armadilha inválida (lookback=",
+               InpTrapLookback, " | volMA=", InpTrapVolMAPeriod,
+               " | volMult=", DoubleToString(InpTrapVolMultiplier, 2),
+               " | RR=", DoubleToString(InpTrapRiskReward, 2),
+               " | buffer=", DoubleToString(InpTrapStopBufferPips, 2), ").");
+         return(INIT_FAILED);
+        }
+     }
+
 //--- Configuração do objeto de execução
    trade.SetExpertMagicNumber(InpMagicNumber);
    trade.SetDeviationInPoints(10);
+
+//--- Garante a exibição das descrições dos objetos gráficos (Fimathe)
+   if(!ChartSetInteger(0, CHART_SHOW_OBJECT_DESCR, true))
+      Print("AlphaBot - AVISO: não foi possível ativar CHART_SHOW_OBJECT_DESCR (erro ",
+            GetLastError(), ").");
 
    if(!trade.SetTypeFillingBySymbol(_Symbol))
       Print("AlphaBot - AVISO: não foi possível definir o modo de preenchimento (filling) para ",
@@ -226,11 +391,36 @@ int OnInit()
 
    Print("AlphaBot - Padrões ativos -> Martelo: ", (InpUseHammer ? "ON" : "OFF"),
          " | Engolfo: ", (InpUseEngulfing ? "ON" : "OFF"), ".");
+   Print("AlphaBot - Motor de Sinal de Entrada: ", EnumToString(InpEntrySignalType), ".");
+   if(InpEntrySignalType == SIGNAL_FIMATHE)
+     {
+      if(InpFimatheCalcType == FIMATHE_USE_ATR)
+         Print("AlphaBot FIMATHE - Cálculo=ATR (período=", InpFimatheATRPeriod,
+               " | mult=", DoubleToString(InpFimatheATRMult, 2), ").");
+      else
+         Print("AlphaBot FIMATHE - Cálculo=SWING (velas da pernada/recuo=",
+               InpFimatheSwingBars, ").");
+      Print("AlphaBot FIMATHE - Breakeven 1º subciclo=",
+            (InpUseSubcycleProtect ? "ON" : "OFF"),
+            " | Reversão (Virar a Mão)=",
+            (InpAllowFimatheReversal ? "ON" : "OFF"), ".");
+     }
+   if(InpEntrySignalType == SIGNAL_TRAP)
+      Print("AlphaBot ARMADILHA - Lookback=", InpTrapLookback,
+            " | VolMA=", InpTrapVolMAPeriod,
+            " | VolMult=", DoubleToString(InpTrapVolMultiplier, 2),
+            " | R:R=", DoubleToString(InpTrapRiskReward, 2),
+            " | Buffer(pips)=", DoubleToString(InpTrapStopBufferPips, 2), ".");
    Print("AlphaBot - Ação em sinal oposto: ", EnumToString(InpOppositeAction), ".");
    Print("AlphaBot - Gradiente Linear: ", (InpEnableGL ? "ATIVO" : "INATIVO"),
          " (níveis SL=", InpLevelsSL, " | níveis TP=", InpLevelsTP,
          " | lote=", DoubleToString(InpLoteInicial, 2),
          " | MagicGL=", InpMagicGL, ").");
+   Print("AlphaBot - Piramidagem (Gradiente Positivo): ",
+         (InpEnablePositivePyramid ? "ATIVA" : "INATIVA"),
+         " (lote base=", DoubleToString(InpPositiveLotBase, 2),
+         " | parcial=", DoubleToString(InpPartialCloseVolume, 2),
+         " | SL nativo 1 nível atrás, sem TP nativo).");
    Print("AlphaBot - Grid Bidirecional: ", (InpBidirectionalGrid ? "ATIVO" : "INATIVO"),
          " (Magic BUY=", InpMagicGLBuy, " | Magic SELL=", InpMagicGLSell,
          " | Alvo=$", DoubleToString(InpTargetProfitMoney, 2),
@@ -250,6 +440,15 @@ void OnDeinit(const int reason)
       IndicatorRelease(g_handle_ma_macro);
       g_handle_ma_macro=INVALID_HANDLE;
      }
+
+   if(g_handle_atr!=INVALID_HANDLE)
+     {
+      IndicatorRelease(g_handle_atr);
+      g_handle_atr=INVALID_HANDLE;
+     }
+
+//--- Remove as linhas do Fimathe ao remover o robô / trocar de timeframe
+   ClearFimatheChannels();
 
    Print("AlphaBot - Desinicializado. Código de motivo: ", reason);
   }
@@ -467,6 +666,682 @@ ENUM_ALPHA_SIGNAL CheckPriceActionSignal()
      }
 
    return(SIGNAL_NONE);
+  }
+
+//+==================================================================+
+//|              VISUALIZAÇÃO GRÁFICA DOS CANAIS FIMATHE              |
+//+==================================================================+
+
+//+------------------------------------------------------------------+
+//| Cria/atualiza as linhas do Canal de Referência (CR) e da Zona     |
+//| Neutra (ZN) no gráfico. Usa ObjectFind para não recriar objetos   |
+//| já existentes a cada tick.                                        |
+//+------------------------------------------------------------------+
+void DrawFimatheChannels(const double crTopo, const double crBottom, const double znOuter, const bool canalAlta)
+  {
+   string nomeTopo  = FIMATHE_PREFIX + "CR_Topo";
+   string nomeDiv   = FIMATHE_PREFIX + "CR_ZN_Divisoria";
+   string nomeZn    = FIMATHE_PREFIX + "ZN_Fundo";
+   string nomeTxtCR = FIMATHE_PREFIX + "Txt_CR";
+   string nomeTxtZN = FIMATHE_PREFIX + "Txt_ZN";
+
+//--- Garante que o MT5 exiba as descrições dos objetos no gráfico
+   ChartSetInteger(0, CHART_SHOW_OBJECT_DESCR, true);
+
+//--- Linha superior do Canal de Referência (CR)
+   if(ObjectFind(0, nomeTopo) < 0)
+     {
+      ObjectCreate(0, nomeTopo, OBJ_HLINE, 0, 0, crTopo);
+      ObjectSetInteger(0, nomeTopo, OBJPROP_COLOR, clrDodgerBlue);
+      ObjectSetInteger(0, nomeTopo, OBJPROP_STYLE, STYLE_SOLID);
+      ObjectSetInteger(0, nomeTopo, OBJPROP_WIDTH, 2);
+      ObjectSetInteger(0, nomeTopo, OBJPROP_BACK, true);
+      ObjectSetInteger(0, nomeTopo, OBJPROP_SELECTABLE, false);
+     }
+   else
+      ObjectSetDouble(0, nomeTopo, OBJPROP_PRICE, 0, crTopo);
+   ObjectSetString(0, nomeTopo, OBJPROP_TEXT, "FIMATHE: Topo CR (Gatilho de COMPRA)");
+
+//--- Divisória entre o CR e a ZN
+   if(ObjectFind(0, nomeDiv) < 0)
+     {
+      ObjectCreate(0, nomeDiv, OBJ_HLINE, 0, 0, crBottom);
+      ObjectSetInteger(0, nomeDiv, OBJPROP_COLOR, clrYellow);
+      ObjectSetInteger(0, nomeDiv, OBJPROP_STYLE, STYLE_DOT);
+      ObjectSetInteger(0, nomeDiv, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(0, nomeDiv, OBJPROP_BACK, true);
+      ObjectSetInteger(0, nomeDiv, OBJPROP_SELECTABLE, false);
+     }
+   else
+      ObjectSetDouble(0, nomeDiv, OBJPROP_PRICE, 0, crBottom);
+   ObjectSetString(0, nomeDiv, OBJPROP_TEXT, "FIMATHE: Divisória (CR / ZN)");
+
+//--- Borda externa da Zona Neutra (ZN)
+   if(ObjectFind(0, nomeZn) < 0)
+     {
+      ObjectCreate(0, nomeZn, OBJ_HLINE, 0, 0, znOuter);
+      ObjectSetInteger(0, nomeZn, OBJPROP_COLOR, clrOrangeRed);
+      ObjectSetInteger(0, nomeZn, OBJPROP_STYLE, STYLE_SOLID);
+      ObjectSetInteger(0, nomeZn, OBJPROP_WIDTH, 2);
+      ObjectSetInteger(0, nomeZn, OBJPROP_BACK, true);
+      ObjectSetInteger(0, nomeZn, OBJPROP_SELECTABLE, false);
+     }
+   else
+      ObjectSetDouble(0, nomeZn, OBJPROP_PRICE, 0, znOuter);
+   ObjectSetString(0, nomeZn, OBJPROP_TEXT,
+                   (canalAlta ? "FIMATHE: Fundo ZN (Gatilho de VENDA)"
+                              : "FIMATHE: Topo ZN (Gatilho de COMPRA)"));
+
+//--- Rótulos das regiões, ancorados próximos ao candle atual (lado direito)
+   datetime tempoAncora = iTime(_Symbol, PERIOD_CURRENT, 0);
+   double   meioCR      = (crTopo + crBottom) / 2.0;
+   double   meioZN      = (crBottom + znOuter) / 2.0;
+
+//--- Texto no meio do Canal de Referência
+   if(ObjectFind(0, nomeTxtCR) < 0)
+     {
+      ObjectCreate(0, nomeTxtCR, OBJ_TEXT, 0, tempoAncora, meioCR);
+      ObjectSetInteger(0, nomeTxtCR, OBJPROP_ANCHOR, ANCHOR_RIGHT);
+      ObjectSetInteger(0, nomeTxtCR, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, nomeTxtCR, OBJPROP_BACK, false);
+     }
+   ObjectSetInteger(0, nomeTxtCR, OBJPROP_TIME, 0, tempoAncora);
+   ObjectSetDouble(0, nomeTxtCR, OBJPROP_PRICE, 0, meioCR);
+   ObjectSetInteger(0, nomeTxtCR, OBJPROP_COLOR, clrDodgerBlue);
+   ObjectSetInteger(0, nomeTxtCR, OBJPROP_FONTSIZE, 9);
+   ObjectSetString(0, nomeTxtCR, OBJPROP_FONT, "Arial Bold");
+   ObjectSetString(0, nomeTxtCR, OBJPROP_TEXT, "[ CANAL DE REFERÊNCIA ]");
+
+//--- Texto no meio da Zona Neutra
+   if(ObjectFind(0, nomeTxtZN) < 0)
+     {
+      ObjectCreate(0, nomeTxtZN, OBJ_TEXT, 0, tempoAncora, meioZN);
+      ObjectSetInteger(0, nomeTxtZN, OBJPROP_ANCHOR, ANCHOR_RIGHT);
+      ObjectSetInteger(0, nomeTxtZN, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, nomeTxtZN, OBJPROP_BACK, false);
+     }
+   ObjectSetInteger(0, nomeTxtZN, OBJPROP_TIME, 0, tempoAncora);
+   ObjectSetDouble(0, nomeTxtZN, OBJPROP_PRICE, 0, meioZN);
+   ObjectSetInteger(0, nomeTxtZN, OBJPROP_COLOR, clrOrange);
+   ObjectSetInteger(0, nomeTxtZN, OBJPROP_FONTSIZE, 9);
+   ObjectSetString(0, nomeTxtZN, OBJPROP_FONT, "Arial Bold");
+   ObjectSetString(0, nomeTxtZN, OBJPROP_TEXT, "[ ZONA NEUTRA - PROIBIDO OPERAR ]");
+
+   g_fimatheGraficoAtivo = true;
+
+   Print("[FIMATHE GRAPHICS] Canais desenhados (",
+         (canalAlta ? "ALTA" : "BAIXA"), ") -> CR Topo: ",
+         DoubleToString(crTopo, _Digits), " | CR Fundo: ",
+         DoubleToString(crBottom, _Digits), " | ZN Externo: ",
+         DoubleToString(znOuter, _Digits));
+  }
+
+//+------------------------------------------------------------------+
+//| Remove TODAS as linhas gráficas do Fimathe (prefixo dedicado).    |
+//+------------------------------------------------------------------+
+void ClearFimatheChannels()
+  {
+   ObjectsDeleteAll(0, FIMATHE_PREFIX);
+   g_fimatheGraficoAtivo = false;
+
+//--- Libera os canais para que um novo setup seja fixado no próximo ciclo
+   g_fimatheCanaisDefinidos = false;
+   g_fimatheUltimaBarraLog  = 0;
+  }
+
+//+==================================================================+
+//|              MOTOR DE SINAL FIMATHE (Rompimento CR + ZN)          |
+//|                                                                    |
+//| O bloco CR+ZN tem altura definida por estrutura de preço (pernada/ |
+//| recuo) OU por ATR. O CR vai da mínima à máxima da pernada; a ZN é o |
+//| canal contíguo de mesma altura, posicionado conforme a tendência:   |
+//|   ALTA : ZN abaixo do CR  |  BAIXA : ZN acima do CR                 |
+//|                                                                    |
+//| REGRA DE OURO: os canais são FIXOS (estáticos) e NÃO se recalculam |
+//| a cada tick. Só são redefinidos após um rompimento válido que      |
+//| resulte em ordem aberta (ou no fim do ciclo).                      |
+//|                                                                    |
+//| Gatilhos estritos no FECHAMENTO dos candles (índice nativo MT5):   |
+//|   COMPRA: rates[1].close >  BandTop    E rates[2].close <= BandTop |
+//|   VENDA : rates[1].close <  BandBottom E rates[2].close >= BandBottom|
+//|   ZONA NEUTRA: BandBottom <= rates[1].close <= BandTop -> SEM TRADE|
+//+==================================================================+
+
+//+------------------------------------------------------------------+
+//| Fixa (uma única vez) os canais CR e ZN. A amplitude vem da        |
+//| estrutura de preço (pernada/recuo) OU do ATR, conforme o input.   |
+//| A partir daqui os níveis ficam ESTÁTICOS até que ocorra rompimento|
+//| e uma ordem seja aberta.                                          |
+//+------------------------------------------------------------------+
+bool FimatheDefinirCanais()
+  {
+   double channelHeight = 0.0;
+   double crTopo        = 0.0;
+   double crBottom      = 0.0;
+   bool   canalAlta     = true;
+
+   if(InpFimatheCalcType == FIMATHE_USE_ATR)
+     {
+      //--- AMPLITUDE VIA ATR: topo do CR na máxima do último candle fechado
+      if(g_handle_atr == INVALID_HANDLE)
+        {
+         Print("AlphaBot FIMATHE - ERRO: handle do ATR inválido (InpFimatheATRPeriod=",
+               InpFimatheATRPeriod, ").");
+         return(false);
+        }
+
+      if(Bars(_Symbol, PERIOD_CURRENT) < InpFimatheATRPeriod + 5)
+         return(false);
+
+      double atr[];
+      ArraySetAsSeries(atr, true);
+      if(CopyBuffer(g_handle_atr, 0, 1, 1, atr) != 1)
+        {
+         Print("AlphaBot FIMATHE - ERRO: CopyBuffer(ATR) retornou ", GetLastError(), ".");
+         return(false);
+        }
+
+      channelHeight = atr[0] * InpFimatheATRMult;
+      if(channelHeight <= 0.0)
+         return(false);
+
+      MqlRates rates[];
+      ArraySetAsSeries(rates, true);
+      if(CopyRates(_Symbol, PERIOD_CURRENT, 0, 2, rates) != 2)
+        {
+         Print("AlphaBot FIMATHE - ERRO: CopyRates retornou ", GetLastError(), ".");
+         return(false);
+        }
+
+      //--- Orientação sempre de ALTA (ZN abaixo do CR)
+      crTopo    = rates[1].high;
+      crBottom  = crTopo - channelHeight;
+      canalAlta = true;
+     }
+   else
+     {
+      //--- AMPLITUDE VIA PERNADA/RECUO (PRICE ACTION)
+      if(InpFimatheSwingBars < 2)
+        {
+         Print("AlphaBot FIMATHE - ERRO: InpFimatheSwingBars deve ser >= 2.");
+         return(false);
+        }
+
+      if(Bars(_Symbol, PERIOD_CURRENT) < InpFimatheSwingBars + 2)
+         return(false);
+
+      //--- Maior máxima e menor mínima dos últimos N candles (exclui a vela atual)
+      int shiftHigh = iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, InpFimatheSwingBars, 1);
+      int shiftLow  = iLowest(_Symbol, PERIOD_CURRENT, MODE_LOW, InpFimatheSwingBars, 1);
+
+      if(shiftHigh < 0 || shiftLow < 0)
+        {
+         Print("AlphaBot FIMATHE - ERRO: iHighest/iLowest retornaram ", GetLastError(), ".");
+         return(false);
+        }
+
+      double highest = iHigh(_Symbol, PERIOD_CURRENT, shiftHigh);
+      double lowest  = iLow(_Symbol, PERIOD_CURRENT, shiftLow);
+
+      channelHeight = highest - lowest;
+      if(channelHeight <= 0.0)
+         return(false);
+
+      //--- Tendência pela recência dos extremos: máxima mais recente => ALTA
+      canalAlta = (shiftHigh <= shiftLow);
+
+      crTopo   = highest;
+      crBottom = lowest;
+     }
+
+//--- Fixação estática das bordas (CR e ZN contíguos, mesma altura)
+   g_fimatheCRTop     = crTopo;
+   g_fimatheCRBottom  = crBottom;
+   g_fimatheCanalAlta = canalAlta;
+
+   if(canalAlta)
+     {
+      //--- ALTA: ZN abaixo do CR (gatilho de venda abaixo do fundo da ZN)
+      g_fimatheZNBottom = crBottom - channelHeight;
+      g_fimatheZNTop    = 0.0;
+     }
+   else
+     {
+      //--- BAIXA: ZN acima do CR (gatilho de compra acima do topo da ZN)
+      g_fimatheZNTop    = crTopo + channelHeight;
+      g_fimatheZNBottom = 0.0;
+     }
+
+   g_fimatheChannelHeight   = channelHeight;
+   g_fimatheCanaisDefinidos = true;
+
+//--- Desenha as linhas exatamente nos valores estáticos
+   DrawFimatheChannels(g_fimatheCRTop, g_fimatheCRBottom,
+                       (canalAlta ? g_fimatheZNBottom : g_fimatheZNTop),
+                       g_fimatheCanalAlta);
+
+   Print("[FIMATHE] Canais FIXADOS [",
+         (InpFimatheCalcType == FIMATHE_USE_ATR ? "ATR" : "SWING"),
+         " | ", (canalAlta ? "ALTA" : "BAIXA"), "] -> CR Topo: ",
+         DoubleToString(g_fimatheCRTop, _Digits),
+         " | CR Fundo: ", DoubleToString(g_fimatheCRBottom, _Digits),
+         " | ZN Externo: ",
+         DoubleToString((canalAlta ? g_fimatheZNBottom : g_fimatheZNTop), _Digits),
+         " | Altura: ", DoubleToString(channelHeight, _Digits), ".");
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Limites do bloco CR+ZN (níveis efetivos de disparo).              |
+//| COMPRA rompe acima do topo; VENDA rompe abaixo do fundo.          |
+//+------------------------------------------------------------------+
+double FimatheBandTop()
+  {
+   return(g_fimatheCanalAlta ? g_fimatheCRTop : g_fimatheZNTop);
+  }
+
+double FimatheBandBottom()
+  {
+   return(g_fimatheCanalAlta ? g_fimatheZNBottom : g_fimatheCRBottom);
+  }
+
+//+------------------------------------------------------------------+
+//| Avalia o rompimento ESTRITO contra os canais estáticos.           |
+//+------------------------------------------------------------------+
+ENUM_ALPHA_SIGNAL CheckFimatheSignal()
+  {
+//--- Não abre novos setups enquanto existir posição ativa do robô
+   if(ExistePosicaoRobo())
+      return(SIGNAL_NONE);
+
+//--- Fixa os canais apenas UMA vez por ciclo (mantém-se estáticos)
+   if(!g_fimatheCanaisDefinidos)
+     {
+      if(!FimatheDefinirCanais())
+         return(SIGNAL_NONE);
+     }
+
+//--- rates[0] = candle atual | rates[1] = candle de sinal | rates[2] = candle anterior
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   if(CopyRates(_Symbol, PERIOD_CURRENT, 0, 3, rates) != 3)
+     {
+      Print("AlphaBot FIMATHE - ERRO: CopyRates retornou ", GetLastError(), ".");
+      return(SIGNAL_NONE);
+     }
+
+   double fechamentoAtual     = rates[1].close; // fechamento do candle de sinal
+   double fechamentoAnterior  = rates[2].close; // fechamento do candle anterior
+
+//--- Limites efetivos do bloco CR+ZN (dependem da orientação/tendência)
+   double bandTop    = FimatheBandTop();
+   double bandBottom = FimatheBandBottom();
+
+//--- ZONA NEUTRA: proibido negociar dentro da faixa [BandBottom ; BandTop]
+   if(fechamentoAtual >= bandBottom && fechamentoAtual <= bandTop)
+     {
+      if(rates[0].time != g_fimatheUltimaBarraLog)
+        {
+         g_fimatheUltimaBarraLog = rates[0].time;
+         Print("[FIMATHE AGUARDANDO] CR Topo: ",
+               DoubleToString(g_fimatheCRTop, _Digits),
+               " | ZN Fundo: ", DoubleToString(g_fimatheZNBottom, _Digits),
+               " | Preço Atual: ", DoubleToString(fechamentoAtual, _Digits),
+               " | Status: Fora de zona de disparo");
+        }
+      return(SIGNAL_NONE);
+     }
+
+//--- Gatilho de COMPRA: rompimento estritamente acima do topo do bloco,
+//--- vindo de dentro/abaixo do canal (candle anterior dentro do bloco)
+   if(fechamentoAtual > bandTop && fechamentoAnterior <= bandTop)
+     {
+      g_signalPadrao = "Fimathe (Rompimento Superior)";
+      Print("SINAL DE COMPRA VALIDADO [FIMATHE]: Fechamento (",
+            DoubleToString(fechamentoAtual, _Digits), ") > Topo do Canal (",
+            DoubleToString(bandTop, _Digits), ") | Anterior (",
+            DoubleToString(fechamentoAnterior, _Digits), ") <= Topo.");
+      return(SIGNAL_BUY);
+     }
+
+//--- Gatilho de VENDA: rompimento estritamente abaixo do fundo do bloco,
+//--- vindo de dentro/acima do canal (candle anterior dentro do bloco)
+   if(fechamentoAtual < bandBottom && fechamentoAnterior >= bandBottom)
+     {
+      g_signalPadrao = "Fimathe (Rompimento Inferior)";
+      Print("SINAL DE VENDA VALIDADO [FIMATHE]: Fechamento (",
+            DoubleToString(fechamentoAtual, _Digits), ") < Fundo do Canal (",
+            DoubleToString(bandBottom, _Digits), ") | Anterior (",
+            DoubleToString(fechamentoAnterior, _Digits), ") >= Fundo.");
+      return(SIGNAL_SELL);
+     }
+
+   return(SIGNAL_NONE);
+  }
+
+//+==================================================================+
+//|      MOTOR ARMADILHA DE LIQUIDEZ / WYCKOFF (FAKE BREAKOUT)        |
+//|                                                                    |
+//| Detecta armadilhas de liquidez no fechamento da vela 1:            |
+//|   COMPRA (Spring / Bear Trap): a mínima fura o suporte e o         |
+//|   fechamento volta para cima, com volume de absorção acima da      |
+//|   média (Wyckoff).                                                 |
+//|   VENDA  (Upthrust / Bull Trap): a máxima fura a resistência e o   |
+//|   fechamento volta para baixo, com volume acima da média.          |
+//+==================================================================+
+
+//+------------------------------------------------------------------+
+//| Tamanho de 1 pip conforme os dígitos do símbolo.                  |
+//+------------------------------------------------------------------+
+double TrapPipSize()
+  {
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   if(digits == 3 || digits == 5)
+      return(10.0 * _Point);
+   return(_Point);
+  }
+
+//+------------------------------------------------------------------+
+//| Avalia a armadilha de liquidez no fechamento da vela 1.           |
+//+------------------------------------------------------------------+
+ENUM_ALPHA_SIGNAL CheckTrapSignal()
+  {
+   if(InpTrapLookback < 2 || InpTrapVolMAPeriod < 2)
+      return(SIGNAL_NONE);
+
+//--- Avalia apenas UMA vez por candle fechado (evita reavaliação por tick)
+   datetime barraSinal = iTime(_Symbol, PERIOD_CURRENT, 1);
+   if(barraSinal == 0 || barraSinal == g_trapUltimaBarraAvaliada)
+      return(SIGNAL_NONE);
+   g_trapUltimaBarraAvaliada = barraSinal;
+
+//--- Barras suficientes para suporte/resistência + média de volume
+   if(Bars(_Symbol, PERIOD_CURRENT) < InpTrapLookback + InpTrapVolMAPeriod + 3)
+      return(SIGNAL_NONE);
+
+//--- A) Níveis de liquidez: menor mínima e maior máxima (i = 2 .. 1 + lookback)
+   int shiftHigh = iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, InpTrapLookback, 2);
+   int shiftLow  = iLowest(_Symbol, PERIOD_CURRENT, MODE_LOW, InpTrapLookback, 2);
+   if(shiftHigh < 0 || shiftLow < 0)
+      return(SIGNAL_NONE);
+
+   double resistanceLevel = iHigh(_Symbol, PERIOD_CURRENT, shiftHigh);
+   double supportLevel    = iLow(_Symbol, PERIOD_CURRENT, shiftLow);
+
+//--- B) Média móvel simples do volume (i = 2 .. 1 + InpTrapVolMAPeriod)
+   double volSum = 0.0;
+   for(int i = 2; i <= 1 + InpTrapVolMAPeriod; i++)
+      volSum += (double)iVolume(_Symbol, PERIOD_CURRENT, i);
+
+   double volMA = volSum / (double)InpTrapVolMAPeriod;
+   if(volMA <= 0.0)
+      return(SIGNAL_NONE);
+
+   double vol1 = (double)iVolume(_Symbol, PERIOD_CURRENT, 1);
+   bool   isHighVolume = (vol1 >= volMA * InpTrapVolMultiplier);
+
+//--- Dados da vela de sinal
+   double low1   = iLow(_Symbol, PERIOD_CURRENT, 1);
+   double high1  = iHigh(_Symbol, PERIOD_CURRENT, 1);
+   double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+
+   double pip    = TrapPipSize();
+   double buffer = InpTrapStopBufferPips * pip;
+
+//--- C) COMPRA (Spring / Bear Trap): fura o suporte, fecha acima, com volume
+   if(low1 < supportLevel && close1 > supportLevel && isHighVolume)
+     {
+      g_trapAtivo    = true;
+      g_trapStopLoss = low1 - buffer;
+      g_signalPadrao = "Armadilha (Spring / Bear Trap)";
+
+      Print("SINAL DE COMPRA VALIDADO [ARMADILHA]: Mínima (",
+            DoubleToString(low1, _Digits), ") < Suporte (",
+            DoubleToString(supportLevel, _Digits), ") | Fechamento (",
+            DoubleToString(close1, _Digits), ") > Suporte | Volume ",
+            DoubleToString(vol1, 0), " >= ", DoubleToString(volMA * InpTrapVolMultiplier, 0),
+            " | SL=", DoubleToString(g_trapStopLoss, _Digits), ".");
+      return(SIGNAL_BUY);
+     }
+
+//--- D) VENDA (Upthrust / Bull Trap): fura a resistência, fecha abaixo, com volume
+   if(high1 > resistanceLevel && close1 < resistanceLevel && isHighVolume)
+     {
+      g_trapAtivo    = true;
+      g_trapStopLoss = high1 + buffer;
+      g_signalPadrao = "Armadilha (Upthrust / Bull Trap)";
+
+      Print("SINAL DE VENDA VALIDADO [ARMADILHA]: Máxima (",
+            DoubleToString(high1, _Digits), ") > Resistência (",
+            DoubleToString(resistanceLevel, _Digits), ") | Fechamento (",
+            DoubleToString(close1, _Digits), ") < Resistência | Volume ",
+            DoubleToString(vol1, 0), " >= ", DoubleToString(volMA * InpTrapVolMultiplier, 0),
+            " | SL=", DoubleToString(g_trapStopLoss, _Digits), ".");
+      return(SIGNAL_SELL);
+     }
+
+   return(SIGNAL_NONE);
+  }
+
+//+------------------------------------------------------------------+
+//| FUNÇÃO CENTRALIZADORA DE SINAIS DE ENTRADA                        |
+//| Encaminha para o motor escolhido no painel de inputs:             |
+//|   SIGNAL_CANDLE_PATTERNS -> Padrões de Candle (Engolfo/Martelo)   |
+//|   SIGNAL_FIMATHE         -> Metodologia Fimathe (CR + ZN)         |
+//|   SIGNAL_TRAP            -> Armadilha de Liquidez / Wyckoff       |
+//+------------------------------------------------------------------+
+ENUM_ALPHA_SIGNAL CheckEntrySignal()
+  {
+   if(InpEntrySignalType == SIGNAL_FIMATHE)
+      return(CheckFimatheSignal());
+
+   if(InpEntrySignalType == SIGNAL_TRAP)
+      return(CheckTrapSignal());
+
+   return(CheckPriceActionSignal());
+  }
+
+//+------------------------------------------------------------------+
+//| Reinicia o estado do Motor Fimathe (subciclo/Breakeven).          |
+//+------------------------------------------------------------------+
+void ResetFimatheState()
+  {
+   g_entradaFimathe       = false;
+   g_fimatheBEFeito       = false;
+   g_fimatheAnchorTicket  = 0;
+   g_fimatheChannelHeight = 0.0;
+  }
+
+//+------------------------------------------------------------------+
+//| Localiza o ticket da posição-âncora deste robô numa direção.      |
+//+------------------------------------------------------------------+
+ulong FimatheTicketAncora(const int direcao)
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
+
+      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if((direcao == 1 && tipo == POSITION_TYPE_BUY) ||
+         (direcao == -1 && tipo == POSITION_TYPE_SELL))
+         return(ticket);
+     }
+
+   return(0);
+  }
+
+//+------------------------------------------------------------------+
+//| SUBCICLO DE PROTEÇÃO FIMATHE (Breakeven no 1º Canal)              |
+//| Enquanto a posição-âncora da Fimathe estiver aberta, monitora o   |
+//| lucro flutuante. Ao percorrer 1 canal (ChannelHeight) a favor,    |
+//| move o Stop Loss para o preço exato de entrada (0x0/Breakeven).   |
+//+------------------------------------------------------------------+
+void ManageFimatheSubcycle()
+  {
+   if(!InpUseSubcycleProtect || !g_entradaFimathe || g_fimatheBEFeito)
+      return;
+
+   if(g_fimatheAnchorTicket == 0)
+      return;
+
+//--- A âncora já não existe mais: encerra o monitoramento do subciclo
+   if(!PositionSelectByTicket(g_fimatheAnchorTicket))
+     {
+      ResetFimatheState();
+      return;
+     }
+
+   ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   double precoEntrada = PositionGetDouble(POSITION_PRICE_OPEN);
+   double precoAtual   = (tipo == POSITION_TYPE_BUY)
+                         ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                         : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   if(precoAtual <= 0.0 || precoEntrada <= 0.0 || g_fimatheChannelHeight <= 0.0)
+      return;
+
+//--- Distância percorrida a favor da operação
+   double distanciaFavor = (tipo == POSITION_TYPE_BUY)
+                           ? (precoAtual - precoEntrada)
+                           : (precoEntrada - precoAtual);
+
+//--- Ainda não completou 1 canal a favor
+   if(distanciaFavor < g_fimatheChannelHeight)
+      return;
+
+   double slAtual = PositionGetDouble(POSITION_SL);
+   double novoSL  = NormalizeDouble(precoEntrada, _Digits);
+
+//--- Já está em Breakeven (ou melhor): nada a fazer
+   if(tipo == POSITION_TYPE_BUY && slAtual != 0.0 && slAtual >= novoSL)
+     {
+      g_fimatheBEFeito = true;
+      return;
+     }
+
+   if(tipo == POSITION_TYPE_SELL && slAtual != 0.0 && slAtual <= novoSL)
+     {
+      g_fimatheBEFeito = true;
+      return;
+     }
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   double tp = PositionGetDouble(POSITION_TP);
+
+   if(trade.PositionModify(g_fimatheAnchorTicket, novoSL, tp))
+     {
+      g_fimatheBEFeito = true;
+      Print("[FIMATHE] Subciclo de 1 Canal atingido. Posição movida para Breakeven");
+     }
+   else
+     {
+      Print("[FIMATHE] ERRO ao mover a posição-âncora para Breakeven | ticket=",
+            g_fimatheAnchorTicket, " | retcode=", trade.ResultRetcode(),
+            " (", trade.ResultRetcodeDescription(), ").");
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| REVERSÃO FIMATHE (VIRAR A MÃO)                                    |
+//| Com posição aberta, monitora o rompimento da ZN (contra COMPRA)   |
+//| ou do CR (contra VENDA). Se a reversão estiver habilitada, encerra|
+//| o ciclo e abre a posição oposta; caso contrário, apenas encerra.  |
+//+------------------------------------------------------------------+
+void ManageFimatheReversal()
+  {
+   if(InpEntrySignalType != SIGNAL_FIMATHE)
+      return;
+
+//--- O Grid Bidirecional gerencia as pernas por conta própria
+   if(InpBidirectionalGrid)
+      return;
+
+//--- Direção da posição ativa do ciclo (âncora/grade)
+   int direcao = 0;
+   if(InpEnableGL && g_glGrid.ativo)
+      direcao = g_glGrid.direcao;
+   else
+      direcao = GetOpenPositionDirection();
+
+   if(direcao == 0)
+      return;
+
+//--- Sem canais de referência fixados não há como avaliar o rompimento
+   double bandTop    = FimatheBandTop();
+   double bandBottom = FimatheBandBottom();
+   if(bandTop <= 0.0 || bandBottom <= 0.0 || bandTop <= bandBottom)
+      return;
+
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   if(CopyRates(_Symbol, PERIOD_CURRENT, 0, 2, rates) != 2)
+      return;
+
+   double fechamento = rates[1].close;
+
+//--- Rompimento contra a COMPRA: fechou estritamente abaixo do fundo do bloco
+   bool reversaoCompra = (direcao == 1  && fechamento < bandBottom);
+//--- Rompimento contra a VENDA: fechou estritamente acima do topo do bloco
+   bool reversaoVenda  = (direcao == -1 && fechamento > bandTop);
+
+   if(!reversaoCompra && !reversaoVenda)
+      return;
+
+//--- Reversão desativada: encerra a posição e limpa os canais
+   if(!InpAllowFimatheReversal)
+     {
+      if(InpEnableGL)
+         CloseLegPositions(g_glGrid, "Fimathe - Rompimento contra a posição");
+      else
+        {
+         ulong ticketFechado = 0;
+         CloseOpenPosition(ticketFechado);
+        }
+
+      ResetFimatheState();
+      ClearFimatheChannels();
+
+      Print("[FIMATHE] Rompimento contra a posição (reversão desativada). ",
+            "Posição encerrada e canais removidos. Aguardando novo sinal neutro.");
+      return;
+     }
+
+//--- Reversão habilitada: encerra TODO o ciclo na direção atual
+   if(InpEnableGL)
+      CloseLegPositions(g_glGrid, "Fimathe Reversal (Virada de Mão)");
+   else
+     {
+      ulong ticketFechado = 0;
+      CloseOpenPosition(ticketFechado);
+     }
+
+   ResetFimatheState();
+
+//--- Abre a posição oposta (Virada de Mão)
+   if(reversaoCompra)
+      ExecuteSell();
+   else
+      ExecuteBuy();
+
+//--- Recalcula e redesenha os canais ajustados ao novo sentido
+   g_fimatheCanaisDefinidos = false;
+   ClearFimatheChannels();
+   FimatheDefinirCanais();
+
+   if(reversaoCompra)
+      Print("[FIMATHE REVERSAL] Rompimento confirmado da ZN. ",
+            "Compra encerrada e Venda aberta (Virada de Mão)");
+   else
+      Print("[FIMATHE REVERSAL] Rompimento confirmado do CR. ",
+            "Venda encerrada e Compra aberta (Virada de Mão)");
   }
 
 //+------------------------------------------------------------------+
@@ -752,6 +1627,8 @@ void ResetGL(CGLGrid &st, const string motivo = "")
 
    ArrayResize(st.nivelAberto, 0);
    ArrayResize(st.nivelTicket, 0);
+   ArrayResize(st.nivelPositivo, 0);
+   ArrayResize(st.nivelParcial, 0);
   }
 
 //+------------------------------------------------------------------+
@@ -795,11 +1672,15 @@ void CalculateGLLevels(CGLGrid &st, const double precoEntrada, const int direcao
    int totalNiveis = InpLevelsSL + InpLevelsTP + 1;
    ArrayResize(st.nivelAberto, totalNiveis);
    ArrayResize(st.nivelTicket, totalNiveis);
+   ArrayResize(st.nivelPositivo, totalNiveis);
+   ArrayResize(st.nivelParcial, totalNiveis);
 
    for(int i = 0; i < totalNiveis; i++)
      {
-      st.nivelAberto[i] = false;
-      st.nivelTicket[i] = 0;
+      st.nivelAberto[i]   = false;
+      st.nivelTicket[i]   = 0;
+      st.nivelPositivo[i] = false;
+      st.nivelParcial[i]  = false;
      }
 
 //--- Registra a operação principal como âncora do nível 0
@@ -847,18 +1728,22 @@ void GL_SincronizarEstado(CGLGrid &st)
 
       if(ticket == 0 || !PositionSelectByTicket(ticket))
         {
-         st.nivelAberto[i] = false;
-         st.nivelTicket[i] = 0;
+         st.nivelAberto[i]   = false;
+         st.nivelTicket[i]   = 0;
+         st.nivelPositivo[i] = false;
+         st.nivelParcial[i]  = false;
         }
      }
   }
 
 //+------------------------------------------------------------------+
 //| Abre uma sub-operação a mercado no nível informado.               |
-//| O Take Profit é posicionado no nível imediatamente acima (k+1).   |
-//| O Stop Loss é o Stop Loss global da perna (proteção individual).  |
+//| Gradiente Negativo (drawdown): lote padrão, TP no nível k+1 e SL  |
+//| global (comportamento original).                                  |
+//| Gradiente Positivo (piramidagem): lote base, SL nativo 1 nível    |
+//| atrás e SEM TP nativo (alvo gerido virtualmente).                 |
 //+------------------------------------------------------------------+
-bool GL_OpenPosition(CGLGrid &st, const int offset)
+bool GL_OpenPosition(CGLGrid &st, const int offset, const bool positivo = false)
   {
    if(!st.ativo)
       return(false);
@@ -875,9 +1760,25 @@ bool GL_OpenPosition(CGLGrid &st, const int offset)
    if(offsetAlvo > InpLevelsTP)
       return(false);
 
-   double tp  = NormalizeDouble(GL_PrecoDoNivel(st, offsetAlvo), _Digits);
-   double sl  = NormalizeDouble(st.globalSL, _Digits);
-   double lote= GL_NormalizarLote(InpLoteInicial);
+   bool   piramidar = (positivo && InpEnablePositivePyramid);
+   double tp   = 0.0;
+   double sl   = 0.0;
+   double lote = 0.0;
+
+   if(piramidar)
+     {
+      //--- GRADIENTE POSITIVO: lote base, SL nativo 1 nível atrás, SEM TP nativo
+      tp   = 0.0;
+      sl   = NormalizeDouble(GL_PrecoDoNivel(st, offset - 1), _Digits);
+      lote = GL_NormalizarLote(InpPositiveLotBase);
+     }
+   else
+     {
+      //--- GRADIENTE NEGATIVO (drawdown): comportamento original
+      tp   = NormalizeDouble(GL_PrecoDoNivel(st, offsetAlvo), _Digits);
+      sl   = NormalizeDouble(st.globalSL, _Digits);
+      lote = GL_NormalizarLote(InpLoteInicial);
+     }
 
    if(lote <= 0.0)
      {
@@ -886,7 +1787,8 @@ bool GL_OpenPosition(CGLGrid &st, const int offset)
      }
 
    string comentario = "GL " + (st.direcao == 1 ? "BUY" : "SELL") +
-                       " Nivel " + IntegerToString(offset);
+                       " Nivel " + IntegerToString(offset) +
+                       (piramidar ? " Piramide" : "");
 
 //--- Usa SEMPRE o Magic exclusivo da perna nas reentradas
    trade.SetExpertMagicNumber(st.magicSub);
@@ -905,11 +1807,14 @@ bool GL_OpenPosition(CGLGrid &st, const int offset)
       if(ticket == 0)
          ticket = (ulong)trade.ResultOrder();
 
-      st.nivelAberto[idx] = true;
-      st.nivelTicket[idx] = ticket;
+      st.nivelAberto[idx]   = true;
+      st.nivelTicket[idx]   = ticket;
+      st.nivelPositivo[idx] = piramidar;
+      st.nivelParcial[idx]  = false;
 
       Print("AlphaBot GL - Sub-operação aberta no nível ", offset,
             " (", (st.direcao == 1 ? "COMPRA" : "VENDA"), ")",
+            (piramidar ? " [GRADIENTE POSITIVO]" : " [GRADIENTE NEGATIVO]"),
             " | ticket=", ticket,
             " | preço=", DoubleToString(trade.ResultPrice(), _Digits),
             " | TP=", DoubleToString(tp, _Digits),
@@ -943,8 +1848,10 @@ void GL_ClosePositionAt(CGLGrid &st, const int offset, const string motivo)
 
    if(ticket == 0 || !PositionSelectByTicket(ticket))
      {
-      st.nivelAberto[idx] = false;
-      st.nivelTicket[idx] = 0;
+      st.nivelAberto[idx]   = false;
+      st.nivelTicket[idx]   = 0;
+      st.nivelPositivo[idx] = false;
+      st.nivelParcial[idx]  = false;
       return;
      }
 
@@ -956,8 +1863,10 @@ void GL_ClosePositionAt(CGLGrid &st, const int offset, const string motivo)
             ". Retcode=", trade.ResultRetcode(),
             " (", trade.ResultRetcodeDescription(), ").");
 
-   st.nivelAberto[idx] = false;
-   st.nivelTicket[idx] = 0;
+   st.nivelAberto[idx]   = false;
+   st.nivelTicket[idx]   = 0;
+   st.nivelPositivo[idx] = false;
+   st.nivelParcial[idx]  = false;
   }
 
 //+------------------------------------------------------------------+
@@ -982,8 +1891,10 @@ void CheckGLDrawdownZone(CGLGrid &st, const double prevM, const double curM)
 
 //+------------------------------------------------------------------+
 //| ZONA DE LUCRO (rolagem de posições)                               |
-//| Ao atingir o nível k: fecha a posição de k-1 e abre/engatilha     |
-//| nova posição em k, com TP no nível k+1 (regra de ouro da zona TP).|
+//| Gradiente Negativo: ao atingir o nível k, fecha a posição de k-1  |
+//| e engatilha nova posição em k, com TP no nível k+1 (rolagem).     |
+//| Gradiente Positivo (piramidagem): NÃO fecha os runners positivos  |
+//| já abertos e engatilha uma nova reentrada no nível alcançado.     |
 //+------------------------------------------------------------------+
 void CheckGLProfitZone(CGLGrid &st, const double prevM, const double curM)
   {
@@ -1000,8 +1911,28 @@ void CheckGLProfitZone(CGLGrid &st, const double prevM, const double curM)
    if(nivelMax == InpLevelsTP)
       return;
 
-//--- Realiza o lucro de todas as posições ancoradas abaixo do nível
-//--- alcançado (na rolagem normal equivale a fechar o nível nivelMax-1)
+   if(InpEnablePositivePyramid)
+     {
+      //--- GRADIENTE POSITIVO: preserva os runners (não os fecha na rolagem)
+      for(int offset = nivelMax - 1; offset >= -InpLevelsSL; offset--)
+        {
+         int idx = GL_IndiceDoNivel(offset);
+         if(idx < 0 || idx >= ArraySize(st.nivelAberto) || !st.nivelAberto[idx])
+            continue;
+
+         if(st.nivelPositivo[idx])
+            continue; // runner do gradiente positivo segue vivo, protegido pelo SL nativo
+
+         GL_ClosePositionAt(st, offset,
+                            "rolagem para o nível " + IntegerToString(nivelMax));
+        }
+
+      //--- Nova reentrada de piramidagem no nível alcançado (alvo virtual em k+1)
+      GL_OpenPosition(st, nivelMax, true);
+      return;
+     }
+
+//--- Gradiente Negativo: rolagem original
    for(int offset = nivelMax - 1; offset >= -InpLevelsSL; offset--)
      {
       int idx = GL_IndiceDoNivel(offset);
@@ -1012,6 +1943,75 @@ void CheckGLProfitZone(CGLGrid &st, const double prevM, const double curM)
 
 //--- Regra de ouro: engatilha nova posição no nível alcançado rumo ao próximo
    GL_OpenPosition(st, nivelMax);
+  }
+
+//+------------------------------------------------------------------+
+//| FECHAMENTO PARCIAL VIRTUAL DO GRADIENTE POSITIVO                  |
+//| Monitora cada reentrada positiva: ao atingir o nível alvo (1 nível |
+//| à frente da entrada), fecha parcialmente o volume base via TP      |
+//| virtual, deixando o "runner" remanescente protegido pelo SL nativo |
+//| já enviado na abertura. Só age sobre posições do Gradiente         |
+//| Positivo; o Gradiente Negativo permanece intocado.                 |
+//+------------------------------------------------------------------+
+void GL_ManagePositivePartials(CGLGrid &st, const double curM)
+  {
+   if(!InpEnablePositivePyramid)
+      return;
+
+   int total = ArraySize(st.nivelAberto);
+
+   for(int idx = 0; idx < total; idx++)
+     {
+      if(!st.nivelAberto[idx] || !st.nivelPositivo[idx] || st.nivelParcial[idx])
+         continue;
+
+      int offset     = idx - InpLevelsSL;
+      int offsetAlvo = offset + 1;
+
+      if(offsetAlvo > InpLevelsTP)
+         continue;
+
+//--- Alvo virtual: 1 nível à frente do preço de entrada da reentrada
+      double metricaAlvo = GL_MetricaDoNivel(st, offsetAlvo);
+      if(curM < metricaAlvo)
+         continue;
+
+      ulong ticket = st.nivelTicket[idx];
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+
+      double volume = PositionGetDouble(POSITION_VOLUME);
+
+//--- Só faz a parcial se o volume ainda for o lote base cheio (ainda não parciou)
+      if(MathAbs(volume - InpPositiveLotBase) > 0.0000001)
+        {
+         st.nivelParcial[idx] = true;
+         continue;
+        }
+
+      if(InpPartialCloseVolume <= 0.0 || InpPartialCloseVolume >= volume)
+        {
+         Print("[GRID POSITIVO] AVISO: volume de parcial inválido (",
+               DoubleToString(InpPartialCloseVolume, 2),
+               ") para o ticket ", ticket, " com volume ",
+               DoubleToString(volume, 2), ". Parcial ignorada.");
+         st.nivelParcial[idx] = true;
+         continue;
+        }
+
+      if(trade.PositionClosePartial(ticket, InpPartialCloseVolume))
+        {
+         st.nivelParcial[idx] = true;
+         Print("[GRID POSITIVO] Parcial executada no ticket ", ticket,
+               ". Runner protegido no SL nativo");
+        }
+      else
+        {
+         Print("[GRID POSITIVO] ERRO na parcial do ticket ", ticket,
+               ". Retcode=", trade.ResultRetcode(),
+               " (", trade.ResultRetcodeDescription(), ").");
+        }
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -1124,6 +2124,8 @@ void CloseAllRobotPositions(const string motivo = "")
    ResetGL(g_glGrid, "");
    ResetGL(g_glBuy, "");
    ResetGL(g_glSell, "");
+   ResetFimatheState();
+   ClearFimatheChannels();
   }
 
 //+------------------------------------------------------------------+
@@ -1295,6 +2297,9 @@ void ManageGradient(CGLGrid &st)
    CheckGLDrawdownZone(st, prevM, curM);
    CheckGLProfitZone(st, prevM, curM);
 
+//--- Fechamento parcial virtual (Virtual TP) exclusivo do Gradiente Positivo
+   GL_ManagePositivePartials(st, curM);
+
    st.ultimaMetrica = curM;
 
 //--- Log de depuração (periódico) com os próximos níveis desta perna
@@ -1320,6 +2325,41 @@ bool ExistePosicaoRobo()
      }
 
    return(false);
+  }
+
+//+------------------------------------------------------------------+
+//| Limpeza automática das linhas Fimathe quando o ciclo termina:     |
+//| se não restar NENHUMA posição do robô (TP/SL/fecho da cesta), as  |
+//| linhas são removidas do gráfico para evitar poluição visual.      |
+//+------------------------------------------------------------------+
+void CheckFimatheGraphicsCleanup()
+  {
+   bool temPosicao = ExistePosicaoRobo();
+
+//--- Registra que o ciclo teve posição ativa
+   if(temPosicao)
+     {
+      g_fimatheTinhaPosicao = true;
+      return;
+     }
+
+//--- Sem posições: só limpa na TRANSIÇÃO "tinha posição" -> "sem posição".
+//--- Isto evita apagar/redesenhar os canais ESTÁTICOS a cada tick enquanto
+//--- o motor apenas aguarda um novo rompimento.
+   if(!g_fimatheTinhaPosicao)
+      return;
+
+   g_fimatheTinhaPosicao = false;
+
+   if(!g_fimatheGraficoAtivo)
+     {
+      g_fimatheCanaisDefinidos = false;
+      return;
+     }
+
+   ClearFimatheChannels();
+   Print("[FIMATHE GRAPHICS] Ciclo encerrado (sem posições do robô). ",
+         "Canais removidos do gráfico.");
   }
 
 //+------------------------------------------------------------------+
@@ -1373,8 +2413,29 @@ bool CheckGlobalHedgeExit()
 void ExecuteBuy()
   {
    double precoEntrada = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double sl = NormalizeDouble(precoEntrada - (InpStopLossGlobal * _Point), _Digits);
-   double tp = NormalizeDouble(precoEntrada + (InpTakeProfitGlobal * _Point), _Digits);
+   double sl = 0.0;
+   double tp = 0.0;
+
+//--- SL/TP específicos da Armadilha de Liquidez (baseados no pavio + R:R)
+   if(g_trapAtivo)
+     {
+      sl = NormalizeDouble(g_trapStopLoss, _Digits);
+      double risco = precoEntrada - sl;
+      if(risco <= 0.0)
+        {
+         Print("AlphaBot - ERRO [ARMADILHA]: distância de risco inválida para COMPRA (SL=",
+               DoubleToString(sl, _Digits), " | Ask=",
+               DoubleToString(precoEntrada, _Digits), "). Ordem abortada.");
+         g_trapAtivo = false;
+         return;
+        }
+      tp = NormalizeDouble(precoEntrada + risco * InpTrapRiskReward, _Digits);
+     }
+   else
+     {
+      sl = NormalizeDouble(precoEntrada - (InpStopLossGlobal * _Point), _Digits);
+      tp = NormalizeDouble(precoEntrada + (InpTakeProfitGlobal * _Point), _Digits);
+     }
 
    if(trade.Buy(InpLoteInicial, _Symbol, precoEntrada, sl, tp, "AlphaBot Compra"))
      {
@@ -1385,6 +2446,19 @@ void ExecuteBuy()
             " | TP: ", DoubleToString(tp, _Digits));
       Print("AlphaBot - Ticket: ", trade.ResultOrder(), ".");
 
+      if(InpEntrySignalType == SIGNAL_FIMATHE)
+        {
+         g_entradaFimathe      = true;
+         g_fimatheBEFeito      = false;
+         g_fimatheAnchorTicket = FimatheTicketAncora(1);
+         g_fimatheCanaisDefinidos = false; // canais consumidos pelo rompimento
+         Print("[FIMATHE] Entrada de COMPRA registrada. Subciclo de 1 Canal ",
+               (InpUseSubcycleProtect ? "ATIVO" : "INATIVO"),
+               " | âncora=", g_fimatheAnchorTicket, ".");
+        }
+      else
+         ResetFimatheState();
+
       if(InpEnableGL)
          CalculateGLLevels(g_glGrid, trade.ResultPrice(), 1);
      }
@@ -1394,6 +2468,9 @@ void ExecuteBuy()
             trade.ResultRetcode(), " (", trade.ResultRetcodeDescription(),
             ") | Erro: ", GetLastError());
      }
+
+//--- Consome o sinal da Armadilha (usado apenas uma vez)
+   g_trapAtivo = false;
   }
 
 //+------------------------------------------------------------------+
@@ -1402,8 +2479,29 @@ void ExecuteBuy()
 void ExecuteSell()
   {
    double precoEntrada = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double sl = NormalizeDouble(precoEntrada + (InpStopLossGlobal * _Point), _Digits);
-   double tp = NormalizeDouble(precoEntrada - (InpTakeProfitGlobal * _Point), _Digits);
+   double sl = 0.0;
+   double tp = 0.0;
+
+//--- SL/TP específicos da Armadilha de Liquidez (baseados no pavio + R:R)
+   if(g_trapAtivo)
+     {
+      sl = NormalizeDouble(g_trapStopLoss, _Digits);
+      double risco = sl - precoEntrada;
+      if(risco <= 0.0)
+        {
+         Print("AlphaBot - ERRO [ARMADILHA]: distância de risco inválida para VENDA (SL=",
+               DoubleToString(sl, _Digits), " | Bid=",
+               DoubleToString(precoEntrada, _Digits), "). Ordem abortada.");
+         g_trapAtivo = false;
+         return;
+        }
+      tp = NormalizeDouble(precoEntrada - risco * InpTrapRiskReward, _Digits);
+     }
+   else
+     {
+      sl = NormalizeDouble(precoEntrada + (InpStopLossGlobal * _Point), _Digits);
+      tp = NormalizeDouble(precoEntrada - (InpTakeProfitGlobal * _Point), _Digits);
+     }
 
    if(trade.Sell(InpLoteInicial, _Symbol, precoEntrada, sl, tp, "AlphaBot Venda"))
      {
@@ -1414,6 +2512,19 @@ void ExecuteSell()
             " | TP: ", DoubleToString(tp, _Digits));
       Print("AlphaBot - Ticket: ", trade.ResultOrder(), ".");
 
+      if(InpEntrySignalType == SIGNAL_FIMATHE)
+        {
+         g_entradaFimathe      = true;
+         g_fimatheBEFeito      = false;
+         g_fimatheAnchorTicket = FimatheTicketAncora(-1);
+         g_fimatheCanaisDefinidos = false; // canais consumidos pelo rompimento
+         Print("[FIMATHE] Entrada de VENDA registrada. Subciclo de 1 Canal ",
+               (InpUseSubcycleProtect ? "ATIVO" : "INATIVO"),
+               " | âncora=", g_fimatheAnchorTicket, ".");
+        }
+      else
+         ResetFimatheState();
+
       if(InpEnableGL)
          CalculateGLLevels(g_glGrid, trade.ResultPrice(), -1);
      }
@@ -1423,6 +2534,9 @@ void ExecuteSell()
             trade.ResultRetcode(), " (", trade.ResultRetcodeDescription(),
             ") | Erro: ", GetLastError());
      }
+
+//--- Consome o sinal da Armadilha (usado apenas uma vez)
+   g_trapAtivo = false;
   }
 
 //+------------------------------------------------------------------+
@@ -1555,6 +2669,15 @@ void ExecuteBidirectionalEntry()
 //+------------------------------------------------------------------+
 void OnTick()
   {
+//--- Subciclo de proteção Fimathe (Breakeven no 1º Canal) da posição-âncora
+   ManageFimatheSubcycle();
+
+//--- Reversão Fimathe (Virar a Mão) ao romper a ZN/CR contra a posição
+   ManageFimatheReversal();
+
+//--- Remove as linhas do Fimathe quando o ciclo é encerrado (TP/SL/cesta)
+   CheckFimatheGraphicsCleanup();
+
 //--- GRID BIDIRECIONAL: proteção da cesta + gestão PARALELA das duas grelhas
    if(InpBidirectionalGrid)
      {
@@ -1595,8 +2718,9 @@ void OnTick()
         }
      }
 
-//--- Avalia o price action do candle [1] + filtro de tendência macro
-   ENUM_ALPHA_SIGNAL sinal=CheckPriceActionSignal();
+//--- Motor de sinal de entrada selecionado no painel de inputs
+//--- (Padrões de Candle OU Metodologia Fimathe)
+   ENUM_ALPHA_SIGNAL sinal=CheckEntrySignal();
 
    if(sinal==SIGNAL_NONE)
       return;
@@ -1645,6 +2769,8 @@ void OnTick()
    ulong ticketFechado=0;
    if(!CloseOpenPosition(ticketFechado))
       return;
+
+   ResetFimatheState();
 
    Print("AlphaBot - Posição ", ticketFechado, " encerrada por sinal oposto (",
          g_signalPadrao, ").");
