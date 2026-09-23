@@ -4,10 +4,12 @@
 //|                                                                  |
 //| Foco: Padrões de reversão (Martelo, Martelo Invertido e Engolfo). |
 //| Filtro de tendência macro por Média Móvel (EMA/SMA).             |
+//| Variante: Grid Bidirecional com Hedge (Compra + Venda no mesmo   |
+//| preço base, cada perna com Gradiente Linear independente).       |
 //+------------------------------------------------------------------+
 #property copyright "AlphaBot Trading"
 #property link      "https://www.mql5.com"
-#property version   "1.50"
+#property version   "1.60"
 
 #include <Trade\Trade.mqh>
 
@@ -25,7 +27,7 @@ enum ENUM_OPPOSITE_ACTION
 //| Parâmetros Operacionais - Interface nativa do MT5                |
 //+------------------------------------------------------------------+
 input group "=== AlphaBot - Parâmetros Operacionais ==="
-input double InpLoteInicial      = 0.01; // Lote inicial
+input double InpLoteInicial      = 0.01; // Lote inicial (fixo em todas as reentradas)
 input int    InpPassoGridPontos  = 200;  // Passo do grid (pontos)
 input int    InpStopLossGlobal   = 300;  // Stop Loss global (pontos)
 input int    InpTakeProfitGlobal = 300;  // Take Profit global (pontos)
@@ -57,6 +59,13 @@ input int    InpLevelsSL  = 4;      // Número de Níveis entre Entrada e Stop L
 input int    InpLevelsTP  = 4;      // Número de Níveis entre Entrada e Take Profit
 input long   InpMagicGL   = 654321; // Magic Number exclusivo das posições do Gradiente
 
+input group "=== AlphaBot - Grid Bidirecional (Hedge) ==="
+input bool   InpBidirectionalGrid  = false; // Ativar Grid Bidirecional (Compra + Venda simultâneas)
+input long   InpMagicGLBuy         = 654321; // Magic Number das reentradas de COMPRA
+input long   InpMagicGLSell        = 654322; // Magic Number das reentradas de VENDA
+input double InpMaxDrawdownMoney   = 50.0;   // Perda Máxima Global (em $)
+input double InpTargetProfitMoney  = 20.0;   // Lucro Alvo Global (em $)
+
 //+------------------------------------------------------------------+
 //| Enumeração dos sinais de price action                            |
 //+------------------------------------------------------------------+
@@ -76,20 +85,42 @@ int    g_handle_ma_macro = INVALID_HANDLE; // Handle da Média Móvel Macro
 
 string g_signalPadrao = ""; // Nome do padrão que gerou o último sinal
 
-//+------------------------------------------------------------------+
-//| Estado global do Gradiente Linear (Grade Virtual)                |
-//+------------------------------------------------------------------+
-bool   g_glAtivo       = false; // Gradiente Linear em operação?
-int    g_glDirecao     = 0;     // 1=comprado, -1=vendido
-double g_glEntrada     = 0.0;   // Preço de entrada da operação principal (nível 0)
-double g_glGlobalSL    = 0.0;   // Preço do Stop Loss global
-double g_glGlobalTP    = 0.0;   // Preço do Take Profit global
-double g_glStepSL      = 0.0;   // Tamanho (em preço) de cada nível rumo ao SL
-double g_glStepTP      = 0.0;   // Tamanho (em preço) de cada nível rumo ao TP
-double g_glUltimaMetrica = 0.0; // Última "métrica favorável" observada (evita reaberturas)
+bool   g_hedgeAtivo = false; // Sessão de Hedge Bidirecional iniciada? (mantém as 2 grelhas vivas)
 
-bool   g_glNivelAberto[];  // Estado por nível: há posição aberta?
-ulong  g_glNivelTicket[];  // Ticket associado a cada nível da grade
+//+------------------------------------------------------------------+
+//| Estado de uma "perna" do Gradiente Linear (Grade Virtual).        |
+//| Cada perna possui seu próprio Magic das reentradas e seus arrays  |
+//| de níveis, garantindo que as reentradas de compra não se misturem |
+//| com as reentradas de venda.                                       |
+//+------------------------------------------------------------------+
+class CGLGrid
+  {
+public:
+   bool   ativo;          // Gradiente Linear desta perna em operação?
+   int    direcao;        // 1=compra, -1=venda
+   long   magicAncora;    // Magic da posição principal (âncora)
+   long   magicSub;       // Magic exclusivo das reentradas (sub-operações)
+   double entrada;        // Preço de entrada da operação principal (nível 0)
+   double globalSL;       // Preço do Stop Loss global da perna
+   double globalTP;       // Preço do Take Profit global da perna
+   double stepSL;         // Tamanho (em preço) de cada nível rumo ao SL
+   double stepTP;         // Tamanho (em preço) de cada nível rumo ao TP
+   double ultimaMetrica;  // Última "métrica favorável" observada
+   bool   nivelAberto[];  // Estado por nível: há posição aberta?
+   ulong  nivelTicket[];  // Ticket associado a cada nível da grade
+   datetime ultimoReseed; // Controle anti-spam das tentativas de re-seed
+   datetime ultimoLog;    // Controle de throttling dos logs de depuração
+
+   void DefinirMagics(const long anc, const long sub)
+     {
+      magicAncora = anc;
+      magicSub    = sub;
+     }
+  };
+
+CGLGrid g_glGrid;  // Modo unidirecional (InpEnableGL)
+CGLGrid g_glBuy;   // Perna de COMPRA do Grid Bidirecional
+CGLGrid g_glSell;  // Perna de VENDA do Grid Bidirecional
 
 //+------------------------------------------------------------------+
 //| Cria e valida o handle da Média Móvel Macro.                      |
@@ -148,6 +179,24 @@ int OnInit()
         }
      }
 
+//--- O Grid Bidirecional depende do Gradiente Linear para gerenciar as pernas
+   if(InpBidirectionalGrid && !InpEnableGL)
+     {
+      Alert("AlphaBot - ERRO: o Grid Bidirecional exige o Gradiente Linear ativo ",
+            "(InpEnableGL=true) para gerenciar as pernas de Compra e Venda. Robô NÃO carregado.");
+      Print("AlphaBot - OnInit abortado: InpBidirectionalGrid=true com InpEnableGL=false.");
+      return(INIT_FAILED);
+     }
+
+//--- As pernas de compra e venda NÃO podem compartilhar o mesmo Magic de reentrada
+   if(InpBidirectionalGrid && InpMagicGLBuy==InpMagicGLSell)
+     {
+      Alert("AlphaBot - ERRO: InpMagicGLBuy e InpMagicGLSell devem ser diferentes ",
+            "para não misturar as reentradas da compra com as da venda. Robô NÃO carregado.");
+      Print("AlphaBot - OnInit abortado: Magics das pernas idênticos (", InpMagicGLBuy, ").");
+      return(INIT_FAILED);
+     }
+
 //--- Criação e validação do handle da Média Móvel Macro
    if(!InitMediaMacro())
      {
@@ -163,6 +212,18 @@ int OnInit()
       Print("AlphaBot - AVISO: não foi possível definir o modo de preenchimento (filling) para ",
             _Symbol, " (erro ", GetLastError(), ").");
 
+//--- Associação dos Magics a cada perna do Gradiente Linear.
+//--- No Grid Bidirecional cada perna usa um Magic PRÓPRIO (âncora + reentradas),
+//--- garantindo isolamento total: as reentradas de compra nunca se confundem
+//--- com as de venda em nenhuma varredura de posições.
+   g_glGrid.DefinirMagics(InpMagicNumber, InpMagicGL);
+   g_glBuy.DefinirMagics(InpMagicGLBuy, InpMagicGLBuy);
+   g_glSell.DefinirMagics(InpMagicGLSell, InpMagicGLSell);
+
+   ResetGL(g_glGrid);
+   ResetGL(g_glBuy);
+   ResetGL(g_glSell);
+
    Print("AlphaBot - Padrões ativos -> Martelo: ", (InpUseHammer ? "ON" : "OFF"),
          " | Engolfo: ", (InpUseEngulfing ? "ON" : "OFF"), ".");
    Print("AlphaBot - Ação em sinal oposto: ", EnumToString(InpOppositeAction), ".");
@@ -170,6 +231,10 @@ int OnInit()
          " (níveis SL=", InpLevelsSL, " | níveis TP=", InpLevelsTP,
          " | lote=", DoubleToString(InpLoteInicial, 2),
          " | MagicGL=", InpMagicGL, ").");
+   Print("AlphaBot - Grid Bidirecional: ", (InpBidirectionalGrid ? "ATIVO" : "INATIVO"),
+         " (Magic BUY=", InpMagicGLBuy, " | Magic SELL=", InpMagicGLSell,
+         " | Alvo=$", DoubleToString(InpTargetProfitMoney, 2),
+         " | Perda máx=$", DoubleToString(InpMaxDrawdownMoney, 2), ").");
    Print("AlphaBot - Inicializado com sucesso: conta em modo HEDGE. MagicNumber=",
          InpMagicNumber, ".");
    return(INIT_SUCCEEDED);
@@ -463,6 +528,8 @@ bool CloseOpenPosition(ulong &closedTicket)
 //|                    MÓDULO GRADIENTE LINEAR                        |
 //|  Grade virtual de níveis monitorada via OnTick. As sub-operações  |
 //|  são executadas a mercado quando o preço "toca" cada nível.       |
+//|  Todas as funções operam sobre uma "perna" (CGLGrid), permitindo  |
+//|  gerenciar COMPRA e VENDA simultaneamente e de forma espelhada.   |
 //+==================================================================+
 
 //+------------------------------------------------------------------+
@@ -478,53 +545,54 @@ int GL_IndiceDoNivel(const int offset)
 //| Distância assinada (em preço) do nível em relação à entrada.      |
 //| Positivo = favorável à operação (rumo ao TP).                     |
 //+------------------------------------------------------------------+
-double GL_MetricaDoNivel(const int offset)
+double GL_MetricaDoNivel(CGLGrid &st, const int offset)
   {
    if(offset >= 0)
-      return(offset * g_glStepTP);
+      return(offset * st.stepTP);
 
-   return(offset * g_glStepSL);
+   return(offset * st.stepSL);
   }
 
 //+------------------------------------------------------------------+
 //| Preço exato de um nível da grade virtual.                         |
+//| Compra: metrica positiva sobe | Venda: metrica positiva desce.    |
 //+------------------------------------------------------------------+
-double GL_PrecoDoNivel(const int offset)
+double GL_PrecoDoNivel(CGLGrid &st, const int offset)
   {
-   double metrica = GL_MetricaDoNivel(offset);
+   double metrica = GL_MetricaDoNivel(st, offset);
 
-   if(g_glDirecao == 1)
-      return(g_glEntrada + metrica);
+   if(st.direcao == 1)
+      return(st.entrada + metrica);
 
-   return(g_glEntrada - metrica);
+   return(st.entrada - metrica);
   }
 
 //+------------------------------------------------------------------+
 //| Converte um preço qualquer na "métrica favorável" corrente.       |
 //+------------------------------------------------------------------+
-double GL_MetricaDoPreco(const double preco)
+double GL_MetricaDoPreco(CGLGrid &st, const double preco)
   {
-   if(g_glDirecao == 1)
-      return(preco - g_glEntrada);
+   if(st.direcao == 1)
+      return(preco - st.entrada);
 
-   return(g_glEntrada - preco);
+   return(st.entrada - preco);
   }
 
 //+------------------------------------------------------------------+
 //| Cruzamento favorável: a métrica passou de baixo para o nível.     |
 //+------------------------------------------------------------------+
-bool GL_CruzouFavoravel(const double prevM, const double curM, const int offset)
+bool GL_CruzouFavoravel(CGLGrid &st, const double prevM, const double curM, const int offset)
   {
-   double nivel = GL_MetricaDoNivel(offset);
+   double nivel = GL_MetricaDoNivel(st, offset);
    return(prevM < nivel && curM >= nivel);
   }
 
 //+------------------------------------------------------------------+
 //| Cruzamento adverso: a métrica caiu de cima para baixo do nível.   |
 //+------------------------------------------------------------------+
-bool GL_CruzouAdverso(const double prevM, const double curM, const int offset)
+bool GL_CruzouAdverso(CGLGrid &st, const double prevM, const double curM, const int offset)
   {
-   double nivel = GL_MetricaDoNivel(offset);
+   double nivel = GL_MetricaDoNivel(st, offset);
    return(prevM >= nivel && curM < nivel);
   }
 
@@ -551,9 +619,21 @@ double GL_NormalizarLote(double lote)
   }
 
 //+------------------------------------------------------------------+
-//| Localiza o ticket da posição principal (âncora) deste EA.         |
+//| Verifica se um Magic pertence a este robô (qualquer perna).       |
 //+------------------------------------------------------------------+
-ulong GL_TicketAncora()
+bool GL_MagicPertenceAoRobo(const long magic)
+  {
+   return(magic == InpMagicNumber ||
+          magic == InpMagicGL     ||
+          magic == InpMagicGLBuy  ||
+          magic == InpMagicGLSell);
+  }
+
+//+------------------------------------------------------------------+
+//| Localiza o ticket da posição principal (âncora) desta perna.      |
+//| Filtra por Magic E por direção, separando compra de venda.        |
+//+------------------------------------------------------------------+
+ulong GL_TicketAncora(CGLGrid &st)
   {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
@@ -561,18 +641,29 @@ ulong GL_TicketAncora()
       if(ticket == 0)
          continue;
 
-      if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
-         (long)PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
-         return(ticket);
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      if((long)PositionGetInteger(POSITION_MAGIC) != st.magicAncora)
+         continue;
+
+      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if(st.direcao == 1 && tipo != POSITION_TYPE_BUY)
+         continue;
+      if(st.direcao == -1 && tipo != POSITION_TYPE_SELL)
+         continue;
+
+      return(ticket);
      }
 
    return(0);
   }
 
 //+------------------------------------------------------------------+
-//| Localiza o ticket da sub-operação recém-aberta na grade.          |
+//| Localiza o ticket da sub-operação recém-aberta nesta perna.       |
+//| Filtra pelo Magic exclusivo da perna para não misturar reentradas.|
 //+------------------------------------------------------------------+
-ulong GL_TicketRecemAberto()
+ulong GL_TicketRecemAberto(CGLGrid &st)
   {
    ulong melhor = 0;
 
@@ -582,13 +673,21 @@ ulong GL_TicketRecemAberto()
       if(ticket == 0)
          continue;
 
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol ||
-         (long)PositionGetInteger(POSITION_MAGIC) != InpMagicGL)
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      if((long)PositionGetInteger(POSITION_MAGIC) != st.magicSub)
+         continue;
+
+      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if(st.direcao == 1 && tipo != POSITION_TYPE_BUY)
+         continue;
+      if(st.direcao == -1 && tipo != POSITION_TYPE_SELL)
          continue;
 
       bool mapeado = false;
-      for(int j = 0; j < ArraySize(g_glNivelTicket); j++)
-         if(g_glNivelTicket[j] == ticket)
+      for(int j = 0; j < ArraySize(st.nivelTicket); j++)
+         if(st.nivelTicket[j] == ticket)
            {
             mapeado = true;
             break;
@@ -602,9 +701,10 @@ ulong GL_TicketRecemAberto()
   }
 
 //+------------------------------------------------------------------+
-//| Verifica se ainda existe alguma posição ativa deste robô.         |
+//| Verifica se ainda existe alguma posição ativa desta perna.        |
+//| Considera a âncora (mesma direção) e as reentradas (Magic da perna)|
 //+------------------------------------------------------------------+
-bool GL_ExistePosicaoAtiva()
+bool GL_ExistePosicaoAtiva(CGLGrid &st)
   {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
@@ -616,122 +716,139 @@ bool GL_ExistePosicaoAtiva()
          continue;
 
       long magic = (long)PositionGetInteger(POSITION_MAGIC);
-      if(magic == InpMagicNumber || magic == InpMagicGL)
+
+      if(magic == st.magicSub)
          return(true);
+
+      if(magic == st.magicAncora)
+        {
+         ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+         if((st.direcao == 1 && tipo == POSITION_TYPE_BUY) ||
+            (st.direcao == -1 && tipo == POSITION_TYPE_SELL))
+            return(true);
+        }
      }
 
    return(false);
   }
 
 //+------------------------------------------------------------------+
-//| Reinicia completamente o estado da grade virtual.                 |
+//| Reinicia completamente o estado da grade virtual de uma perna.    |
 //+------------------------------------------------------------------+
-void ResetGL(const string motivo = "")
+void ResetGL(CGLGrid &st, const string motivo = "")
   {
-   if(g_glAtivo && motivo != "")
-      Print("AlphaBot GL - Grade encerrada. Motivo: ", motivo);
+   if(st.ativo && motivo != "")
+      Print("AlphaBot GL - Grade (", (st.direcao == 1 ? "COMPRA" : "VENDA"),
+            ") encerrada. Motivo: ", motivo);
 
-   g_glAtivo        = false;
-   g_glDirecao      = 0;
-   g_glEntrada      = 0.0;
-   g_glGlobalSL     = 0.0;
-   g_glGlobalTP     = 0.0;
-   g_glStepSL       = 0.0;
-   g_glStepTP       = 0.0;
-   g_glUltimaMetrica= 0.0;
+   st.ativo         = false;
+   st.direcao       = 0;
+   st.entrada       = 0.0;
+   st.globalSL      = 0.0;
+   st.globalTP      = 0.0;
+   st.stepSL        = 0.0;
+   st.stepTP        = 0.0;
+   st.ultimaMetrica = 0.0;
 
-   ArrayResize(g_glNivelAberto, 0);
-   ArrayResize(g_glNivelTicket, 0);
+   ArrayResize(st.nivelAberto, 0);
+   ArrayResize(st.nivelTicket, 0);
   }
 
 //+------------------------------------------------------------------+
 //| Calcula os níveis da grade a partir do preço de entrada.          |
 //| Deve ser chamada imediatamente após abrir a operação principal.   |
 //+------------------------------------------------------------------+
-void CalculateGLLevels(const double precoEntrada, const int direcao)
+void CalculateGLLevels(CGLGrid &st, const double precoEntrada, const int direcao)
   {
    if(!InpEnableGL)
       return;
 
-   ResetGL();
+   ResetGL(st);
 
-   g_glAtivo    = true;
-   g_glDirecao  = direcao;
-   g_glEntrada  = precoEntrada;
+   st.ativo   = true;
+   st.direcao = direcao;
+   st.entrada = precoEntrada;
 
 //--- Distâncias globais e passo de cada nível
    double distanciaSL = InpStopLossGlobal * _Point;
    double distanciaTP = InpTakeProfitGlobal * _Point;
 
-   g_glStepSL = distanciaSL / MathMax(1, InpLevelsSL);
-   g_glStepTP = distanciaTP / MathMax(1, InpLevelsTP);
+   st.stepSL = distanciaSL / MathMax(1, InpLevelsSL);
+   st.stepTP = distanciaTP / MathMax(1, InpLevelsTP);
 
-//--- Preços dos extremos (SL e TP globais)
+//--- Preços dos extremos (SL e TP globais) espelhados por direção
    if(direcao == 1)
      {
-      g_glGlobalSL = precoEntrada - distanciaSL;
-      g_glGlobalTP = precoEntrada + distanciaTP;
+      st.globalSL = precoEntrada - distanciaSL;
+      st.globalTP = precoEntrada + distanciaTP;
      }
    else
      {
-      g_glGlobalSL = precoEntrada + distanciaSL;
-      g_glGlobalTP = precoEntrada - distanciaTP;
+      st.globalSL = precoEntrada + distanciaSL;
+      st.globalTP = precoEntrada - distanciaTP;
      }
 
 //--- A métrica inicial é zero (preço posicionado na entrada/nível 0)
-   g_glUltimaMetrica = 0.0;
+   st.ultimaMetrica = 0.0;
 
 //--- Alocação dos arrays da grade virtual
    int totalNiveis = InpLevelsSL + InpLevelsTP + 1;
-   ArrayResize(g_glNivelAberto, totalNiveis);
-   ArrayResize(g_glNivelTicket, totalNiveis);
+   ArrayResize(st.nivelAberto, totalNiveis);
+   ArrayResize(st.nivelTicket, totalNiveis);
 
    for(int i = 0; i < totalNiveis; i++)
      {
-      g_glNivelAberto[i] = false;
-      g_glNivelTicket[i] = 0;
+      st.nivelAberto[i] = false;
+      st.nivelTicket[i] = 0;
      }
 
 //--- Registra a operação principal como âncora do nível 0
-   ulong ticketAncora = GL_TicketAncora();
+   ulong ticketAncora = GL_TicketAncora(st);
    int   idx0         = GL_IndiceDoNivel(0);
 
-   g_glNivelAberto[idx0] = (ticketAncora != 0);
-   g_glNivelTicket[idx0] = ticketAncora;
+   st.nivelAberto[idx0] = (ticketAncora != 0);
+   st.nivelTicket[idx0] = ticketAncora;
 
    Print("=== GRADIENTE LINEAR ATIVADO ===");
    Print("AlphaBot GL - Direção: ", (direcao == 1 ? "COMPRA" : "VENDA"),
          " | Entrada: ", DoubleToString(precoEntrada, _Digits),
          " | Níveis SL: ", InpLevelsSL, " (passo ",
-         DoubleToString(g_glStepSL, _Digits), ")",
+         DoubleToString(st.stepSL, _Digits), ")",
          " | Níveis TP: ", InpLevelsTP, " (passo ",
-         DoubleToString(g_glStepTP, _Digits), ")");
-   Print("AlphaBot GL - Global SL: ", DoubleToString(g_glGlobalSL, _Digits),
-         " | Global TP: ", DoubleToString(g_glGlobalTP, _Digits),
+         DoubleToString(st.stepTP, _Digits), ")");
+   Print("AlphaBot GL - Global SL: ", DoubleToString(st.globalSL, _Digits),
+         " | Global TP: ", DoubleToString(st.globalTP, _Digits),
          " | Lote: ", DoubleToString(InpLoteInicial, 2),
-         " | MagicGL: ", InpMagicGL,
+         " | MagicSub: ", st.magicSub,
          " | Âncora: ", ticketAncora, ".");
+
+//--- Verificação de espelhamento: na COMPRA o TP fica ACIMA e o drawdown ABAIXO;
+//--- na VENDA ocorre o inverso (TP abaixo / drawdown acima).
+   Print("AlphaBot GL - Espelhamento (", (direcao == 1 ? "COMPRA" : "VENDA"),
+         ") | Nível +1 (TP)=", DoubleToString(GL_PrecoDoNivel(st, 1), _Digits),
+         " | Nível -1 (drawdown)=", DoubleToString(GL_PrecoDoNivel(st, -1), _Digits),
+         " | Referência=", DoubleToString(precoEntrada, _Digits), ".");
   }
 
 //+------------------------------------------------------------------+
 //| Sincroniza o estado: níveis cujos tickets foram fechados pelo     |
 //| broker (TP/SL individuais) são liberados para eventual recompra.  |
 //+------------------------------------------------------------------+
-void GL_SincronizarEstado()
+void GL_SincronizarEstado(CGLGrid &st)
   {
-   int total = ArraySize(g_glNivelAberto);
+   int total = ArraySize(st.nivelAberto);
 
    for(int i = 0; i < total; i++)
      {
-      if(!g_glNivelAberto[i])
+      if(!st.nivelAberto[i])
          continue;
 
-      ulong ticket = g_glNivelTicket[i];
+      ulong ticket = st.nivelTicket[i];
 
       if(ticket == 0 || !PositionSelectByTicket(ticket))
         {
-         g_glNivelAberto[i] = false;
-         g_glNivelTicket[i] = 0;
+         st.nivelAberto[i] = false;
+         st.nivelTicket[i] = 0;
         }
      }
   }
@@ -739,18 +856,18 @@ void GL_SincronizarEstado()
 //+------------------------------------------------------------------+
 //| Abre uma sub-operação a mercado no nível informado.               |
 //| O Take Profit é posicionado no nível imediatamente acima (k+1).   |
-//| O Stop Loss é o Stop Loss global (proteção individual).           |
+//| O Stop Loss é o Stop Loss global da perna (proteção individual).  |
 //+------------------------------------------------------------------+
-bool GL_OpenPosition(const int offset)
+bool GL_OpenPosition(CGLGrid &st, const int offset)
   {
-   if(!g_glAtivo)
+   if(!st.ativo)
       return(false);
 
    int idx = GL_IndiceDoNivel(offset);
-   if(idx < 0 || idx >= ArraySize(g_glNivelAberto))
+   if(idx < 0 || idx >= ArraySize(st.nivelAberto))
       return(false);
 
-   if(g_glNivelAberto[idx])
+   if(st.nivelAberto[idx])
       return(false);
 
 //--- Não abre no extremo do TP global (esse nível é de encerramento total)
@@ -758,8 +875,8 @@ bool GL_OpenPosition(const int offset)
    if(offsetAlvo > InpLevelsTP)
       return(false);
 
-   double tp  = NormalizeDouble(GL_PrecoDoNivel(offsetAlvo), _Digits);
-   double sl  = NormalizeDouble(g_glGlobalSL, _Digits);
+   double tp  = NormalizeDouble(GL_PrecoDoNivel(st, offsetAlvo), _Digits);
+   double sl  = NormalizeDouble(st.globalSL, _Digits);
    double lote= GL_NormalizarLote(InpLoteInicial);
 
    if(lote <= 0.0)
@@ -768,12 +885,14 @@ bool GL_OpenPosition(const int offset)
       return(false);
      }
 
-   string comentario = "GL Nivel " + IntegerToString(offset);
+   string comentario = "GL " + (st.direcao == 1 ? "BUY" : "SELL") +
+                       " Nivel " + IntegerToString(offset);
 
-   trade.SetExpertMagicNumber(InpMagicGL);
+//--- Usa SEMPRE o Magic exclusivo da perna nas reentradas
+   trade.SetExpertMagicNumber(st.magicSub);
 
    bool ok = false;
-   if(g_glDirecao == 1)
+   if(st.direcao == 1)
       ok = trade.Buy(lote, _Symbol, 0.0, sl, tp, comentario);
    else
       ok = trade.Sell(lote, _Symbol, 0.0, sl, tp, comentario);
@@ -782,14 +901,15 @@ bool GL_OpenPosition(const int offset)
 
    if(ok)
      {
-      ticket = GL_TicketRecemAberto();
+      ticket = GL_TicketRecemAberto(st);
       if(ticket == 0)
          ticket = (ulong)trade.ResultOrder();
 
-      g_glNivelAberto[idx] = true;
-      g_glNivelTicket[idx] = ticket;
+      st.nivelAberto[idx] = true;
+      st.nivelTicket[idx] = ticket;
 
       Print("AlphaBot GL - Sub-operação aberta no nível ", offset,
+            " (", (st.direcao == 1 ? "COMPRA" : "VENDA"), ")",
             " | ticket=", ticket,
             " | preço=", DoubleToString(trade.ResultPrice(), _Digits),
             " | TP=", DoubleToString(tp, _Digits),
@@ -810,21 +930,21 @@ bool GL_OpenPosition(const int offset)
 //+------------------------------------------------------------------+
 //| Encerra a sub-operação associada a um nível (realização de lucro).|
 //+------------------------------------------------------------------+
-void GL_ClosePositionAt(const int offset, const string motivo)
+void GL_ClosePositionAt(CGLGrid &st, const int offset, const string motivo)
   {
    int idx = GL_IndiceDoNivel(offset);
-   if(idx < 0 || idx >= ArraySize(g_glNivelAberto))
+   if(idx < 0 || idx >= ArraySize(st.nivelAberto))
       return;
 
-   if(!g_glNivelAberto[idx])
+   if(!st.nivelAberto[idx])
       return;
 
-   ulong ticket = g_glNivelTicket[idx];
+   ulong ticket = st.nivelTicket[idx];
 
    if(ticket == 0 || !PositionSelectByTicket(ticket))
      {
-      g_glNivelAberto[idx] = false;
-      g_glNivelTicket[idx] = 0;
+      st.nivelAberto[idx] = false;
+      st.nivelTicket[idx] = 0;
       return;
      }
 
@@ -836,8 +956,8 @@ void GL_ClosePositionAt(const int offset, const string motivo)
             ". Retcode=", trade.ResultRetcode(),
             " (", trade.ResultRetcodeDescription(), ").");
 
-   g_glNivelAberto[idx] = false;
-   g_glNivelTicket[idx] = 0;
+   st.nivelAberto[idx] = false;
+   st.nivelTicket[idx] = 0;
   }
 
 //+------------------------------------------------------------------+
@@ -845,18 +965,18 @@ void GL_ClosePositionAt(const int offset, const string motivo)
 //| A cada nível cruzado no sentido adverso, abre uma sub-operação    |
 //| cujo TP aponta para o nível imediatamente superior.               |
 //+------------------------------------------------------------------+
-void CheckGLDrawdownZone(const double prevM, const double curM)
+void CheckGLDrawdownZone(CGLGrid &st, const double prevM, const double curM)
   {
 //--- Do nível mais profundo (sem tocar o SL global) até o penúltimo
 //--- nível rumo ao TP. Inclui o nível 0 (recuo do lucro para a entrada).
    for(int offset = -(InpLevelsSL - 1); offset <= InpLevelsTP - 1; offset++)
      {
-      if(!GL_CruzouAdverso(prevM, curM, offset))
+      if(!GL_CruzouAdverso(st, prevM, curM, offset))
          continue;
 
       Print("AlphaBot GL - Preço cruzou o nível ", offset,
             " (zona de drawdown/recuo). Engatilhando sub-operação.");
-      GL_OpenPosition(offset);
+      GL_OpenPosition(st, offset);
      }
   }
 
@@ -865,12 +985,12 @@ void CheckGLDrawdownZone(const double prevM, const double curM)
 //| Ao atingir o nível k: fecha a posição de k-1 e abre/engatilha     |
 //| nova posição em k, com TP no nível k+1 (regra de ouro da zona TP).|
 //+------------------------------------------------------------------+
-void CheckGLProfitZone(const double prevM, const double curM)
+void CheckGLProfitZone(CGLGrid &st, const double prevM, const double curM)
   {
 //--- Determina o nível mais alto alcançado neste movimento (trata gaps)
    int nivelMax = -1;
    for(int offset = 1; offset <= InpLevelsTP; offset++)
-      if(GL_CruzouFavoravel(prevM, curM, offset))
+      if(GL_CruzouFavoravel(st, prevM, curM, offset))
          nivelMax = offset;
 
    if(nivelMax <= 0)
@@ -885,49 +1005,20 @@ void CheckGLProfitZone(const double prevM, const double curM)
    for(int offset = nivelMax - 1; offset >= -InpLevelsSL; offset--)
      {
       int idx = GL_IndiceDoNivel(offset);
-      if(idx >= 0 && idx < ArraySize(g_glNivelAberto) && g_glNivelAberto[idx])
-         GL_ClosePositionAt(offset,
+      if(idx >= 0 && idx < ArraySize(st.nivelAberto) && st.nivelAberto[idx])
+         GL_ClosePositionAt(st, offset,
                             "rolagem para o nível " + IntegerToString(nivelMax));
      }
 
 //--- Regra de ouro: engatilha nova posição no nível alcançado rumo ao próximo
-   GL_OpenPosition(nivelMax);
+   GL_OpenPosition(st, nivelMax);
   }
 
 //+------------------------------------------------------------------+
-//| ENCERRAMENTO GLOBAL                                               |
-//| Ao tocar exatamente o SL ou TP global, fecha TODAS as posições    |
-//| do símbolo (principal + gradiente) e limpa a grade virtual.       |
+//| Encerra TODAS as posições de UMA perna (âncora + reentradas) e    |
+//| coloca a grade da perna em modo de espera.                        |
 //+------------------------------------------------------------------+
-bool CheckGLGlobalClose(const double curM)
-  {
-   double metricaTP = g_glStepTP * InpLevelsTP;
-   double metricaSL = -g_glStepSL * InpLevelsSL;
-
-   if(curM >= metricaTP)
-     {
-      Print("AlphaBot GL - TAKE PROFIT GLOBAL atingido (",
-            DoubleToString(g_glGlobalTP, _Digits), "). Encerramento total.");
-      CloseAllGLPositions("TP Global");
-      return(true);
-     }
-
-   if(curM <= metricaSL)
-     {
-      Print("AlphaBot GL - STOP LOSS GLOBAL atingido (",
-            DoubleToString(g_glGlobalSL, _Digits), "). Encerramento total.");
-      CloseAllGLPositions("SL Global");
-      return(true);
-     }
-
-   return(false);
-  }
-
-//+------------------------------------------------------------------+
-//| Fecha TODAS as posições deste robô (principal + gradiente) e     |
-//| coloca a grade em modo de espera pelo próximo sinal técnico.      |
-//+------------------------------------------------------------------+
-void CloseAllGLPositions(const string motivo = "")
+void CloseLegPositions(CGLGrid &st, const string motivo = "")
   {
    int fechadas = 0;
 
@@ -941,63 +1032,339 @@ void CloseAllGLPositions(const string motivo = "")
          continue;
 
       long magic = (long)PositionGetInteger(POSITION_MAGIC);
-      if(magic != InpMagicNumber && magic != InpMagicGL)
+      bool pertence = false;
+
+      if(magic == st.magicSub)
+         pertence = true;
+      else
+         if(magic == st.magicAncora)
+           {
+            ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            if((st.direcao == 1 && tipo == POSITION_TYPE_BUY) ||
+               (st.direcao == -1 && tipo == POSITION_TYPE_SELL))
+               pertence = true;
+           }
+
+      if(!pertence)
          continue;
 
       if(trade.PositionClose(ticket))
-        {
          fechadas++;
-        }
       else
-        {
-         Print("AlphaBot GL - ERRO no encerramento global | ticket=", ticket,
+         Print("AlphaBot GL - ERRO no encerramento da perna | ticket=", ticket,
                ". Retcode=", trade.ResultRetcode(),
                " (", trade.ResultRetcodeDescription(), ").");
-        }
      }
 
-   Print("AlphaBot GL - Encerramento global executado (", motivo,
-         "). Posições fechadas: ", fechadas, ".");
+   Print("AlphaBot GL - Perna ", (st.direcao == 1 ? "COMPRA" : "VENDA"),
+         " encerrada (", motivo, "). Posições fechadas: ", fechadas, ".");
 
-   ResetGL(motivo);
+   ResetGL(st, motivo);
   }
 
 //+------------------------------------------------------------------+
-//| Orquestrador do Gradiente Linear, chamado a cada tick.            |
+//| ENCERRAMENTO GLOBAL DE UMA PERNA                                  |
+//| Ao tocar exatamente o SL ou TP global, fecha as posições da perna.|
 //+------------------------------------------------------------------+
-void ManageGradient()
+bool CheckGLGlobalClose(CGLGrid &st, const double curM)
   {
-   if(!g_glAtivo)
+   double metricaTP = st.stepTP * InpLevelsTP;
+   double metricaSL = -st.stepSL * InpLevelsSL;
+
+   if(curM >= metricaTP)
+     {
+      Print("AlphaBot GL - TAKE PROFIT GLOBAL atingido (",
+            DoubleToString(st.globalTP, _Digits), "). Encerramento da perna.");
+      CloseLegPositions(st, "TP Global");
+      return(true);
+     }
+
+   if(curM <= metricaSL)
+     {
+      Print("AlphaBot GL - STOP LOSS GLOBAL atingido (",
+            DoubleToString(st.globalSL, _Digits), "). Encerramento da perna.");
+      CloseLegPositions(st, "SL Global");
+      return(true);
+     }
+
+   return(false);
+  }
+
+//+------------------------------------------------------------------+
+//| Fecha TODAS as posições deste robô (todas as pernas) e zera as    |
+//| grades virtuais. Usada pela proteção financeira global da cesta.  |
+//+------------------------------------------------------------------+
+void CloseAllRobotPositions(const string motivo = "")
+  {
+   int fechadas = 0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      if(!GL_MagicPertenceAoRobo((long)PositionGetInteger(POSITION_MAGIC)))
+         continue;
+
+      if(trade.PositionClose(ticket))
+         fechadas++;
+      else
+         Print("AlphaBot - ERRO no encerramento total | ticket=", ticket,
+               ". Retcode=", trade.ResultRetcode(),
+               " (", trade.ResultRetcodeDescription(), ").");
+     }
+
+   Print("AlphaBot - Encerramento global executado (", motivo,
+         "). Posições fechadas: ", fechadas, ".");
+
+   ResetGL(g_glGrid, "");
+   ResetGL(g_glBuy, "");
+   ResetGL(g_glSell, "");
+  }
+
+//+------------------------------------------------------------------+
+//| RE-SEED CONTÍNUO DE UMA PERNA                                     |
+//| Mantém o Hedge Bidirecional SEMPRE com as duas grelhas vivas.      |
+//| Quando a grade de uma perna se esgota (TP/SL global ou ausência de |
+//| posições), abre uma NOVA âncora da MESMA direção ao preço atual e  |
+//| recalcula a grade a partir dela. Sem isto, a perna morre e só a    |
+//| outra continua a operar.                                          |
+//+------------------------------------------------------------------+
+bool GL_ReSeedLeg(CGLGrid &st, const int direcao)
+  {
+   if(!InpBidirectionalGrid)
+      return(false);
+
+//--- Throttle: no máximo uma tentativa a cada 2 segundos por perna
+   datetime agora = TimeCurrent();
+   if(st.ultimoReseed > 0 && (agora - st.ultimoReseed) < 2)
+      return(false);
+   st.ultimoReseed = agora;
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(ask <= 0.0 || bid <= 0.0)
+      return(false);
+
+   double preco  = (direcao == 1) ? ask : bid;
+   double distSL = InpStopLossGlobal   * _Point;
+   double distTP = InpTakeProfitGlobal * _Point;
+   double sl     = 0.0;
+   double tp     = 0.0;
+
+//--- COMPRA entra no ASK (SL abaixo / TP acima); VENDA entra no BID (SL acima / TP abaixo)
+   if(direcao == 1)
+     {
+      sl = NormalizeDouble(preco - distSL, _Digits);
+      tp = NormalizeDouble(preco + distTP, _Digits);
+     }
+   else
+     {
+      sl = NormalizeDouble(preco + distSL, _Digits);
+      tp = NormalizeDouble(preco - distTP, _Digits);
+     }
+
+   trade.SetExpertMagicNumber(st.magicSub);
+
+   bool ok = false;
+   if(direcao == 1)
+      ok = trade.Buy(InpLoteInicial, _Symbol, 0.0, sl, tp, "AlphaBot Hedge ReSeed BUY");
+   else
+      ok = trade.Sell(InpLoteInicial, _Symbol, 0.0, sl, tp, "AlphaBot Hedge ReSeed SELL");
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+
+   if(!ok)
+     {
+      Print("[GRID ", (direcao == 1 ? "COMPRA" : "VENDA"),
+            "] RE-SEED FALHOU | retcode=", trade.ResultRetcode(),
+            " (", trade.ResultRetcodeDescription(), ") | preço=",
+            DoubleToString(preco, _Digits), ".");
+      return(false);
+     }
+
+   Print("[GRID ", (direcao == 1 ? "COMPRA" : "VENDA"),
+         "] RE-SEED: nova âncora | preço=", DoubleToString(preco, _Digits),
+         " | SL=", DoubleToString(sl, _Digits),
+         " | TP=", DoubleToString(tp, _Digits),
+         " | ticket=", trade.ResultOrder(), ".");
+
+//--- Reativa a grade da perna a partir do novo preço base
+   CalculateGLLevels(st, preco, direcao);
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Log de depuração agressivo e periódico de uma grelha.             |
+//| Mostra o preço, a métrica e os próximos níveis de Drawdown e TP.  |
+//+------------------------------------------------------------------+
+void GL_LogEstado(CGLGrid &st, const double preco, const double curM,
+                  const string estado, const bool forcar = false)
+  {
+   datetime agora = TimeCurrent();
+   if(!forcar && st.ultimoLog > 0 && (agora - st.ultimoLog) < 60)
+      return;
+   st.ultimoLog = agora;
+
+//--- Próximo nível de drawdown (adverso) ainda não cruzado
+   int proxDD = (InpLevelsSL > 0) ? -InpLevelsSL : 0;
+   for(int k = -1; k >= -InpLevelsSL; k--)
+      if(GL_MetricaDoNivel(st, k) < curM)
+        {
+         proxDD = k;
+         break;
+        }
+
+//--- Próximo nível de lucro (favorável) ainda não cruzado
+   int proxTP = (InpLevelsTP > 0) ? InpLevelsTP : 0;
+   for(int k = 1; k <= InpLevelsTP; k++)
+      if(GL_MetricaDoNivel(st, k) > curM)
+        {
+         proxTP = k;
+         break;
+        }
+
+//--- Na COMPRA o drawdown fica ABAIXO e o TP ACIMA; na VENDA é o inverso.
+   string rotDD = (st.direcao == 1) ? "Inferior" : "Superior";
+   string rotTP = (st.direcao == 1) ? "Superior" : "Inferior";
+
+   Print("[GRID ", (st.direcao == 1 ? "COMPRA" : "VENDA"),
+         "] Preço Atual: ", DoubleToString(preco, _Digits),
+         " | Métrica: ", DoubleToString(curM, _Digits),
+         " | Nível ", rotDD, " (Drawdown): ",
+         DoubleToString(GL_PrecoDoNivel(st, proxDD), _Digits), " (", proxDD, ")",
+         " | Nível ", rotTP, " (TP): ",
+         DoubleToString(GL_PrecoDoNivel(st, proxTP), _Digits), " (", proxTP, ")",
+         " | Estado: ", estado, ".");
+  }
+
+//+------------------------------------------------------------------+
+//| Orquestrador do Gradiente Linear de UMA perna, chamado a cada tick.|
+//+------------------------------------------------------------------+
+void ManageGradient(CGLGrid &st)
+  {
+   if(!st.ativo)
       return;
 
    double preco = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    if(preco <= 0.0)
       return;
 
-   double curM  = GL_MetricaDoPreco(preco);
-   double prevM = g_glUltimaMetrica;
+   int    dir   = st.direcao;
+   double curM  = GL_MetricaDoPreco(st, preco);
+   double prevM = st.ultimaMetrica;
 
 //--- Libera níveis fechados pelo broker (TP/SL individuais)
-   GL_SincronizarEstado();
+   GL_SincronizarEstado(st);
 
 //--- Encerramento global prioritário
-   if(CheckGLGlobalClose(curM))
-      return;
-
-//--- Proteção: se nenhuma posição permanece ativa, encerra a grade
-   if(!GL_ExistePosicaoAtiva())
+   if(CheckGLGlobalClose(st, curM))
      {
-      Print("AlphaBot GL - Nenhuma posição ativa detectada. Grade encerrada; ",
-            "aguardando novo sinal técnico.");
-      ResetGL("Sem posições ativas.");
+      //--- Hedge contínuo: re-semeia a perna que completou, mantendo as duas grelhas vivas
+      if(InpBidirectionalGrid)
+         GL_ReSeedLeg(st, dir);
+
+      return;
+     }
+
+//--- Grade exaurida (sem posições ativas)
+   if(!GL_ExistePosicaoAtiva(st))
+     {
+      if(InpBidirectionalGrid)
+        {
+         Print("[GRID ", (dir == 1 ? "COMPRA" : "VENDA"),
+               "] Grade sem posições ativas -> RE-SEED para manter o hedge contínuo.");
+         GL_ReSeedLeg(st, dir);
+        }
+      else
+        {
+         Print("AlphaBot GL - Nenhuma posição ativa na perna ",
+               (dir == 1 ? "COMPRA" : "VENDA"),
+               ". Grade encerrada; aguardando novo sinal técnico.");
+         ResetGL(st, "Sem posições ativas.");
+        }
+
       return;
      }
 
 //--- Avaliação dos cruzamentos de níveis nas duas zonas
-   CheckGLDrawdownZone(prevM, curM);
-   CheckGLProfitZone(prevM, curM);
+   CheckGLDrawdownZone(st, prevM, curM);
+   CheckGLProfitZone(st, prevM, curM);
 
-   g_glUltimaMetrica = curM;
+   st.ultimaMetrica = curM;
+
+//--- Log de depuração (periódico) com os próximos níveis desta perna
+   GL_LogEstado(st, preco, st.ultimaMetrica, "Aguardando próximo nível");
+  }
+
+//+------------------------------------------------------------------+
+//| Existe alguma posição (âncora ou reentrada) deste robô no símbolo?|
+//+------------------------------------------------------------------+
+bool ExistePosicaoRobo()
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      if(GL_MagicPertenceAoRobo((long)PositionGetInteger(POSITION_MAGIC)))
+         return(true);
+     }
+
+   return(false);
+  }
+
+//+------------------------------------------------------------------+
+//| PROTEÇÃO FINANCEIRA GLOBAL (CESTA DE ORDENS)                      |
+//| Soma o lucro/prejuízo flutuante de TODAS as posições do robô. Se  |
+//| atingir o Alvo de Lucro ou a Perda Máxima, fecha tudo a mercado e |
+//| zera as grades virtuais.                                          |
+//+------------------------------------------------------------------+
+bool CheckGlobalHedgeExit()
+  {
+   double lucroTotal = 0.0;
+   int    posicoes    = 0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      if(!GL_MagicPertenceAoRobo((long)PositionGetInteger(POSITION_MAGIC)))
+         continue;
+
+      lucroTotal += PositionGetDouble(POSITION_PROFIT)
+                  + PositionGetDouble(POSITION_SWAP);
+      posicoes++;
+     }
+
+   if(posicoes == 0)
+      return(false);
+
+   bool alvoLucro   = (InpTargetProfitMoney > 0.0 && lucroTotal >= InpTargetProfitMoney);
+   bool perdaMaxima = (InpMaxDrawdownMoney  > 0.0 && lucroTotal <= -MathAbs(InpMaxDrawdownMoney));
+
+   if(!alvoLucro && !perdaMaxima)
+      return(false);
+
+   Print("AlphaBot HEDGE - CESTA encerrada. P/L flutuante=",
+         DoubleToString(lucroTotal, 2), " | Posições=", posicoes,
+         " | Motivo: ", (alvoLucro ? "Alvo de Lucro Global" : "Perda Máxima Global"), ".");
+
+   CloseAllRobotPositions(alvoLucro ? "Alvo de Lucro Global" : "Perda Máxima Global");
+   return(true);
   }
 
 //+------------------------------------------------------------------+
@@ -1019,7 +1386,7 @@ void ExecuteBuy()
       Print("AlphaBot - Ticket: ", trade.ResultOrder(), ".");
 
       if(InpEnableGL)
-         CalculateGLLevels(trade.ResultPrice(), 1);
+         CalculateGLLevels(g_glGrid, trade.ResultPrice(), 1);
      }
    else
      {
@@ -1048,7 +1415,7 @@ void ExecuteSell()
       Print("AlphaBot - Ticket: ", trade.ResultOrder(), ".");
 
       if(InpEnableGL)
-         CalculateGLLevels(trade.ResultPrice(), -1);
+         CalculateGLLevels(g_glGrid, trade.ResultPrice(), -1);
      }
    else
      {
@@ -1059,15 +1426,173 @@ void ExecuteSell()
   }
 
 //+------------------------------------------------------------------+
+//| Existe alguma posição aberta deste robô com o Magic informado?    |
+//+------------------------------------------------------------------+
+bool ExistePosicaoComMagic(const long magic)
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      if((long)PositionGetInteger(POSITION_MAGIC) == magic)
+         return(true);
+     }
+
+   return(false);
+  }
+
+//+------------------------------------------------------------------+
+//| Envia UMA perna do Hedge a mercado, com Magic próprio, e loga     |
+//| SEMPRE o código de retorno e a descrição (sucesso ou falha).      |
+//+------------------------------------------------------------------+
+bool EnviarPernaHedge(const ENUM_ORDER_TYPE tipo, const long magic,
+                      const double sl, const double tp, const string rotulo)
+  {
+   trade.SetExpertMagicNumber(magic);
+
+   bool ok = false;
+   if(tipo == ORDER_TYPE_BUY)
+      ok = trade.Buy(InpLoteInicial, _Symbol, 0.0, sl, tp, rotulo);
+   else
+      ok = trade.Sell(InpLoteInicial, _Symbol, 0.0, sl, tp, rotulo);
+
+   Print("AlphaBot HEDGE - Ordem ", rotulo,
+         " | tipo=", EnumToString(tipo),
+         " | lote=", DoubleToString(InpLoteInicial, 2),
+         " | SL=", DoubleToString(sl, _Digits),
+         " | TP=", DoubleToString(tp, _Digits),
+         " | preço=", DoubleToString(trade.ResultPrice(), _Digits),
+         " | order=", trade.ResultOrder(),
+         " | deal=", trade.ResultDeal(),
+         " | retcode=", trade.ResultRetcode(),
+         " (", trade.ResultRetcodeDescription(), ")",
+         " | status=", (ok ? "ENVIADA" : "FALHOU"));
+
+   if(ok && !ExistePosicaoComMagic(magic))
+      Print("AlphaBot HEDGE - AVISO: ordem ", rotulo,
+            " retornou sucesso, mas nenhuma posição com Magic ", magic,
+            " foi encontrada. Posições do robô no símbolo: ", PositionsTotal(), ".");
+
+   return(ok);
+  }
+
+//+------------------------------------------------------------------+
+//| GRID BIDIRECIONAL COM HEDGE                                       |
+//| Abre simultaneamente UMA COMPRA e UMA VENDA a mercado, ambas com  |
+//| o mesmo preço base, e ativa o Gradiente Linear espelhado em cada  |
+//| perna (cada uma com seu Magic exclusivo).                         |
+//+------------------------------------------------------------------+
+void ExecuteBidirectionalEntry()
+  {
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   if(ask <= 0.0 || bid <= 0.0)
+     {
+      Print("AlphaBot - ERRO: preços inválidos para abertura Hedge (Ask=",
+            DoubleToString(ask, _Digits), " | Bid=", DoubleToString(bid, _Digits), ").");
+      return;
+     }
+
+//--- Preço base comum às duas pernas do Gradiente Linear (grade virtual)
+   double precoBase = NormalizeDouble((ask + bid) / 2.0, _Digits);
+
+//--- SL/TP calculados a partir do preço de execução REAL de cada perna:
+//---   COMPRA entra no ASK -> SL abaixo / TP acima.
+//---   VENDA  entra no BID -> SL acima  / TP abaixo.
+   double slCompra = NormalizeDouble(ask - InpStopLossGlobal   * _Point, _Digits);
+   double tpCompra = NormalizeDouble(ask + InpTakeProfitGlobal * _Point, _Digits);
+   double slVenda  = NormalizeDouble(bid + InpStopLossGlobal   * _Point, _Digits);
+   double tpVenda  = NormalizeDouble(bid - InpTakeProfitGlobal * _Point, _Digits);
+
+   Print("Tentando abrir Hedge Duplo: Preço ", DoubleToString(precoBase, _Digits),
+         " | TP Compra ", DoubleToString(tpCompra, _Digits),
+         " / SL Compra ", DoubleToString(slCompra, _Digits),
+         " | TP Venda ", DoubleToString(tpVenda, _Digits),
+         " / SL Venda ", DoubleToString(slVenda, _Digits));
+
+//--- Perna de COMPRA (Magic próprio: InpMagicGLBuy)
+   bool okCompra = EnviarPernaHedge(ORDER_TYPE_BUY, InpMagicGLBuy,
+                                    slCompra, tpCompra, "AlphaBot Hedge Compra");
+
+//--- Perna de VENDA (Magic próprio: InpMagicGLSell)
+   bool okVenda = EnviarPernaHedge(ORDER_TYPE_SELL, InpMagicGLSell,
+                                   slVenda, tpVenda, "AlphaBot Hedge Venda");
+
+//--- Restaura o Magic padrão das operações normais
+   trade.SetExpertMagicNumber(InpMagicNumber);
+
+   if(!okCompra)
+      Print("AlphaBot HEDGE - ATENÇÃO: perna de COMPRA NÃO foi aberta. ",
+            "Verifique saldo/margem, modo de preenchimento e nível mínimo de stops.");
+
+   if(!okVenda)
+      Print("AlphaBot HEDGE - ATENÇÃO: perna de VENDA NÃO foi aberta. ",
+            "Verifique saldo/margem, modo de preenchimento e nível mínimo de stops.");
+
+   if(!InpEnableGL)
+      return;
+
+//--- Ativa o Gradiente Linear espelhado a partir do MESMO preço base
+   if(okCompra)
+      CalculateGLLevels(g_glBuy, precoBase, 1);
+
+   if(okVenda)
+      CalculateGLLevels(g_glSell, precoBase, -1);
+
+//--- Sessão de Hedge iniciada: a partir daqui as DUAS grelhas são mantidas vivas
+   g_hedgeAtivo = true;
+   Print("AlphaBot HEDGE - Sessão bidirecional iniciada. As duas grelhas serão mantidas ativas.");
+  }
+
+//+------------------------------------------------------------------+
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick()
   {
-//--- Gradiente Linear ativo: gerencia a grade virtual de forma independente
-   if(g_glAtivo)
+//--- GRID BIDIRECIONAL: proteção da cesta + gestão PARALELA das duas grelhas
+   if(InpBidirectionalGrid)
      {
-      ManageGradient();
-      return;
+      //--- Proteção financeira global (cesta). Se disparar, encerra a sessão de hedge
+      if(ExistePosicaoRobo() && CheckGlobalHedgeExit())
+        {
+         g_hedgeAtivo = false;
+         return;
+        }
+
+      //--- Sessão já iniciada: mantém SEMPRE as duas pernas vivas e processa ambas
+      if(g_hedgeAtivo)
+        {
+         //--- Re-semeia qualquer perna que tenha sido encerrada/esgotada
+         if(!g_glBuy.ativo)
+            GL_ReSeedLeg(g_glBuy, 1);
+
+         if(!g_glSell.ativo)
+            GL_ReSeedLeg(g_glSell, -1);
+
+         //--- Gestão independente e incondicional das DUAS grelhas (sem return entre elas)
+         ManageGradient(g_glBuy);
+         ManageGradient(g_glSell);
+         return;
+        }
+
+      //--- Ainda não iniciada, mas há posições do robô: não aplica lógica de posição única
+      if(ExistePosicaoRobo())
+         return;
+     }
+   else
+     {
+      //--- Gradiente Linear unidirecional ativo: gerencia a grade virtual
+      if(g_glGrid.ativo)
+        {
+         ManageGradient(g_glGrid);
+         return;
+        }
      }
 
 //--- Avalia o price action do candle [1] + filtro de tendência macro
@@ -1081,6 +1606,12 @@ void OnTick()
 //--- Sem posição aberta: abre na direção do sinal
    if(direcaoAtual==0)
      {
+      if(InpBidirectionalGrid)
+        {
+         ExecuteBidirectionalEntry();
+         return;
+        }
+
       if(sinal==SIGNAL_BUY)
          ExecuteBuy();
       else
@@ -1131,8 +1662,5 @@ void OnTick()
       ExecuteBuy();
    else
       ExecuteSell();
-
-//--- Demais lógicas (Gradiente Linear Duplo, Offsetting e HEDGE)
-//---     serão implementadas aqui.
   }
 //+------------------------------------------------------------------+
