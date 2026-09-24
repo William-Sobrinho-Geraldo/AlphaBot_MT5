@@ -14,9 +14,10 @@
 #include <Trade\Trade.mqh>
 
 //+------------------------------------------------------------------+
-//| Prefixo dos objetos gráficos do Motor Fimathe                    |
+//| Prefixos dos objetos gráficos dos Motores Fimathe e SMC          |
 //+------------------------------------------------------------------+
 #define FIMATHE_PREFIX "Fimathe_Obj_"
+#define SMC_PREFIX     "SMC_Obj_"
 
 //+------------------------------------------------------------------+
 //| Ação a tomar quando surge um sinal oposto à posição aberta       |
@@ -31,11 +32,12 @@ enum ENUM_OPPOSITE_ACTION
 //+------------------------------------------------------------------+
 //| Estratégia responsável por gerar o gatilho da primeira ordem      |
 //+------------------------------------------------------------------+
-enum ENUM_ENTRY_SIGNAL_TYPE
+enum ENUM_INPUT_SIGNAL_TYPE
   {
    SIGNAL_CANDLE_PATTERNS, // Padrões de Candle (Engolfo, Martelo)
    SIGNAL_FIMATHE,         // Metodologia Fimathe (Rompimento CR + ZN)
-   SIGNAL_TRAP             // Armadilha de Liquidez / Wyckoff (Fake Breakout + Volume)
+   SIGNAL_TRAP,            // Armadilha de Liquidez / Wyckoff (Fake Breakout + Volume)
+   SIGNAL_SMC              // SMC: CHoCH + FVG (Mudança de Caráter e Desequilíbrio)
   };
 
 //+------------------------------------------------------------------+
@@ -48,33 +50,93 @@ enum ENUM_FIMATHE_CALC
   };
 
 //+------------------------------------------------------------------+
-//| Parâmetros Operacionais - Interface nativa do MT5                |
+//| Tipo de Stop Loss do Motor SMC (CHoCH + FVG)                      |
 //+------------------------------------------------------------------+
-input group "=== AlphaBot - Parâmetros Operacionais ==="
+enum ENUM_SMC_SL_TYPE
+  {
+   SMC_SL_RISCO_RETORNO, // Conservador: SL fixo (pips) + TP por Risco/Retorno
+   SMC_SL_VELA_FVG       // Agressivo: SL além da mínima/máxima da vela do FVG
+  };
+
+//+------------------------------------------------------------------+
+//| Máquina de estados do Motor SMC (reteste institucional do FVG)    |
+//+------------------------------------------------------------------+
+enum ENUM_SMC_STATE
+  {
+   SMC_STATE_IDLE = 0,           // Mapeando estrutura (aguardando CHoCH)
+   SMC_STATE_AGUARDANDO_RETESTE, // CHoCH + FVG mapeados: ordem limite pendente
+   SMC_STATE_EM_TRADE            // Ordem executada: posição aberta
+  };
+
+//+==================================================================+
+//| 1) SELETOR DE ESTRATÉGIA                                          |
+//| Define APENAS a estratégia que gera o gatilho da ORDEM INICIAL.   |
+//| A gestão das posições (Grid/Piramidagem/Hedge) é independente.    |
+//+==================================================================+
+input group "=== SELETOR DE ESTRATÉGIA ==="
+input ENUM_INPUT_SIGNAL_TYPE InpSignalType = SIGNAL_FIMATHE; // Estratégia base de entrada
+
+//+==================================================================+
+//| PARÂMETROS OPERACIONAIS (capital, risco e execução)               |
+//+==================================================================+
+input group "=== PARÂMETROS OPERACIONAIS ==="
+input ENUM_TIMEFRAMES InpTimeFrame = PERIOD_CURRENT; // Timeframe Operacional
 input double InpLoteInicial      = 0.01; // Lote inicial (fixo em todas as reentradas)
-input int    InpPassoGridPontos  = 200;  // Passo do grid (pontos)
 input int    InpStopLossGlobal   = 300;  // Stop Loss global (pontos)
 input int    InpTakeProfitGlobal = 300;  // Take Profit global (pontos)
+input long   InpMagicNumber    = 123456; // Magic Number das posições do robô
+input ENUM_OPPOSITE_ACTION InpOppositeAction = ACTION_CLOSE_AND_REVERSE; // Ação em sinal oposto
 
-input group "=== AlphaBot - Ativação de Padrões ==="
-input bool InpUseHammer    = true; // Usar Martelo / Martelo Invertido
-input bool InpUseEngulfing = true; // Usar Engolfo (Alta / Baixa)
+//+==================================================================+
+//| 2) FILTROS GLOBAIS                                                |
+//| Aplicados a TODAS as estratégias: se ativos e a condição não for  |
+//| cumprida, NENHUMA entrada é permitida.                            |
+//+==================================================================+
+input group "=== FILTROS GLOBAIS (Aplicáveis a todas as estratégias) ==="
+input bool   InpUseFiltroMediaMovel = true;  // Ativar Filtro de Média Móvel Macro?
+input int    InpMaMacroPeriod        = 200;       // MM: Período da média macro
+input ENUM_MA_METHOD InpMaMacroMethod = MODE_EMA; // MM: Método (EMA ou SMA)
+input ENUM_APPLIED_PRICE InpMaMacroAppliedPrice = PRICE_CLOSE; // MM: Preço aplicado
+input bool   InpUseFiltroHorario = false; // Ativar Filtro de Horário?
+input int    InpHoraInicio       = 8;     // Horário: Hora de início (hora do servidor)
+input int    InpHoraFim          = 18;    // Horário: Hora de fim (hora do servidor)
 
-input group "=== AlphaBot - Configurações do Martelo ==="
-input double InpMinLongShadowRatio     = 2.0; // Sombra longa mín. (x Corpo)
-input double InpMaxOppositeShadowRatio = 0.5; // Sombra oposta máx. (x Corpo)
+//+==================================================================+
+//| 3) GESTÃO GLOBAL: Gradiente Linear, Piramidagem e Grid/Hedge      |
+//| Módulos de gestão de posição INDEPENDENTES da estratégia de       |
+//| entrada: interceptam qualquer posição pelo Magic Number.          |
+//+==================================================================+
+input group "=== GESTÃO GLOBAL: Gradiente e Grid ==="
+input bool   InpEnableGL  = true;   // Ativar Gradiente Linear (Grid Dinâmico)?
+input int    InpLevelsSL  = 4;      // Gradiente: Níveis entre Entrada e Stop Loss
+input int    InpLevelsTP  = 4;      // Gradiente: Níveis entre Entrada e Take Profit
+input long   InpMagicGL   = 654321; // Gradiente: Magic exclusivo das reentradas
+input bool   InpEnablePositivePyramid = true; // Piramidagem: Ativar Gradiente Positivo?
+input double InpPositiveLotBase       = 0.02; // Piramidagem: Volume total na abertura
+input double InpPartialCloseVolume    = 0.01; // Piramidagem: Volume fechado no alvo (parcial)
+input bool   InpBidirectionalGrid  = false; // Hedge: Ativar Grid Bidirecional?
+input long   InpMagicGLBuy         = 654321; // Hedge: Magic das reentradas de COMPRA
+input long   InpMagicGLSell        = 654322; // Hedge: Magic das reentradas de VENDA
+input double InpMaxDrawdownMoney   = 50.0;   // Hedge: Perda Máxima Global (em $)
+input double InpTargetProfitMoney  = 20.0;   // Hedge: Lucro Alvo Global (em $)
 
-input group "=== AlphaBot - Configurações do Engolfo ==="
-input double InpMinEngulfingBodyRatio = 1.1; // Cobertura mínima (ex: 1.1 = +10%)
-input int    InpMinCandleBodyPoints   = 50;  // Corpo mínimo (pontos)
+//+==================================================================+
+//| 4) PARÂMETROS ESPECÍFICOS: SMC (CHoCH + FVG)                      |
+//+==================================================================+
+input group "=== PARÂMETROS ESPECÍFICOS: SMC ==="
+input int    InpSMC_SwingBars        = 5;    // SMC: Velas à esq/dir para Topo/Fundo (Fractal)
+input double InpSMC_MinFVGPips       = 2.0;  // SMC: Tamanho mínimo do FVG (Pips) para ser válido
+input ENUM_SMC_SL_TYPE InpSMC_SLType = SMC_SL_RISCO_RETORNO; // SMC: Tipo de Stop Loss
+input double InpSMC_RiskReward       = 3.0;  // SMC: Relação Risco x Retorno (TP / SL)
+input double InpSMC_ConservativeSLPips = 15.0; // SMC: SL conservador (Pips) quando tipo = Risco/Retorno
+input double InpSMC_SLBufferPips     = 2.0;  // SMC: Folga (Pips) do SL agressivo além da vela do FVG
+input int    InpSMC_MaxBarsPending   = 20;   // SMC: Máx. de velas com a ordem pendente antes de cancelar
+input bool   InpSMC_DrawVisuals      = true; // SMC: Desenhar Linhas de CHoCH, Box do FVG e Textos no gráfico
 
-input group "=== AlphaBot - Filtro de Tendência Macro ==="
-input int    InpMaMacroPeriod        = 200;       // Período da média macro
-input ENUM_MA_METHOD InpMaMacroMethod = MODE_EMA; // Método (EMA ou SMA)
-input ENUM_APPLIED_PRICE InpMaMacroAppliedPrice = PRICE_CLOSE; // Preço aplicado
-
-input group "=== AlphaBot - Motor de Sinal de Entrada ==="
-input ENUM_ENTRY_SIGNAL_TYPE InpEntrySignalType = SIGNAL_FIMATHE; // Tipo de Sinal de Entrada
+//+==================================================================+
+//| 5) PARÂMETROS ESPECÍFICOS: FIMATHE (CR + ZN)                      |
+//+==================================================================+
+input group "=== PARÂMETROS ESPECÍFICOS: FIMATHE ==="
 input int    InpFimatheATRPeriod    = 14;   // Fimathe: Período do ATR (Amplitude do Canal)
 input double InpFimatheATRMult      = 1.5;  // Fimathe: Multiplicador do ATR (Altura do CR/ZN)
 input ENUM_FIMATHE_CALC InpFimatheCalcType = FIMATHE_USE_SWING_BARS; // Fimathe: Modo de Cálculo do Canal
@@ -82,34 +144,26 @@ input int    InpFimatheSwingBars    = 10;   // Fimathe: Qtd de Velas da Pernada/
 input bool   InpUseSubcycleProtect  = true; // Fimathe: Breakeven no 1º Subciclo (1 Canal)
 input bool   InpAllowFimatheReversal = true; // Fimathe: Virar a Mão (Reversão Automática ao romper ZN)
 
-input group "=== AlphaBot - Armadilha de Liquidez (Wyckoff) ==="
+//+==================================================================+
+//| 6) PARÂMETROS ESPECÍFICOS: ARMADILHA (WYCKOFF)                    |
+//+==================================================================+
+input group "=== PARÂMETROS ESPECÍFICOS: ARMADILHA (WYCKOFF) ==="
 input int    InpTrapLookback        = 20;   // Armadilha: Velas para buscar Topo/Fundo (Suporte/Resistência)
 input double InpTrapVolMultiplier   = 1.5;  // Armadilha: Multiplicador de Volume de Absorção (vs Média)
 input int    InpTrapVolMAPeriod     = 20;   // Armadilha: Período da Média Móvel de Volume
 input double InpTrapRiskReward      = 2.0;  // Armadilha: Relação Risco x Retorno (TP / SL)
 input double InpTrapStopBufferPips  = 2.0;  // Armadilha: Folga de Stop (Pips) além do Pavio
 
-input group "=== AlphaBot - Execução de Ordens ==="
-input long   InpMagicNumber    = 123456; // Magic Number
-input ENUM_OPPOSITE_ACTION InpOppositeAction = ACTION_CLOSE_AND_REVERSE; // Ação em sinal oposto
-
-input group "=== AlphaBot - Gradiente Linear (Grid Dinâmico) ==="
-input bool   InpEnableGL  = true;   // Ativar Gradiente Linear?
-input int    InpLevelsSL  = 4;      // Número de Níveis entre Entrada e Stop Loss
-input int    InpLevelsTP  = 4;      // Número de Níveis entre Entrada e Take Profit
-input long   InpMagicGL   = 654321; // Magic Number exclusivo das posições do Gradiente
-
-input group "=== AlphaBot - Piramidagem (Gradiente Positivo) ==="
-input bool   InpEnablePositivePyramid = true; // Ativar Piramidagem no Gradiente Positivo
-input double InpPositiveLotBase       = 0.02; // Volume total na abertura (Níveis Positivos)
-input double InpPartialCloseVolume    = 0.01; // Volume a ser fechado no alvo (Parcial)
-
-input group "=== AlphaBot - Grid Bidirecional (Hedge) ==="
-input bool   InpBidirectionalGrid  = false; // Ativar Grid Bidirecional (Compra + Venda simultâneas)
-input long   InpMagicGLBuy         = 654321; // Magic Number das reentradas de COMPRA
-input long   InpMagicGLSell        = 654322; // Magic Number das reentradas de VENDA
-input double InpMaxDrawdownMoney   = 50.0;   // Perda Máxima Global (em $)
-input double InpTargetProfitMoney  = 20.0;   // Lucro Alvo Global (em $)
+//+==================================================================+
+//| 7) PARÂMETROS ESPECÍFICOS: PRICE ACTION (Candles)                 |
+//+==================================================================+
+input group "=== PARÂMETROS ESPECÍFICOS: PRICE ACTION ==="
+input bool   InpUseHammer    = true; // Price Action: Usar Martelo / Martelo Invertido
+input bool   InpUseEngulfing = true; // Price Action: Usar Engolfo (Alta / Baixa)
+input double InpMinLongShadowRatio     = 2.0; // Martelo: Sombra longa mín. (x Corpo)
+input double InpMaxOppositeShadowRatio = 0.5; // Martelo: Sombra oposta máx. (x Corpo)
+input double InpMinEngulfingBodyRatio = 1.1; // Engolfo: Cobertura mínima (ex: 1.1 = +10%)
+input int    InpMinCandleBodyPoints   = 50;  // Engolfo: Corpo mínimo (pontos)
 
 //+------------------------------------------------------------------+
 //| Enumeração dos sinais de price action                            |
@@ -132,6 +186,8 @@ int    g_handle_atr      = INVALID_HANDLE; // Handle do ATR do Motor Fimathe
 string g_signalPadrao = ""; // Nome do padrão que gerou o último sinal
 
 bool   g_hedgeAtivo = false; // Sessão de Hedge Bidirecional iniciada? (mantém as 2 grelhas vivas)
+
+datetime g_ultimaBarraOperacional = 0; // Tempo da última vela lida no timeframe operacional
 
 //--- Estado do Motor Fimathe (proteção de subciclo / Breakeven)
 bool   g_entradaFimathe       = false; // A posição-âncora atual foi gerada pela Fimathe?
@@ -156,6 +212,24 @@ datetime g_fimatheUltimaBarraLog = 0;    // Anti-spam do log de aguardo (1x por 
 bool   g_trapAtivo               = false; // O sinal pendente é da Armadilha?
 double g_trapStopLoss            = 0.0;   // Stop Loss calculado pelo pavio (armadilha)
 datetime g_trapUltimaBarraAvaliada = 0;   // Controle: avalia apenas 1x por candle fechado
+
+//--- Estado do Motor SMC (CHoCH + FVG) - máquina de estados
+ENUM_SMC_STATE g_smcEstado           = SMC_STATE_IDLE; // Estado atual da máquina de estados
+int      g_smcDirecao             = 0;     // +1 = CHoCH de alta (compra) | -1 = CHoCH de baixa (venda)
+double   g_smcChochLevel          = 0.0;   // Nível rompido no CHoCH (topo/fundo de swing)
+double   g_smcFvgTop              = 0.0;   // Borda superior da zona do FVG (topo do box)
+double   g_smcFvgBottom           = 0.0;   // Borda inferior da zona do FVG (fundo do box)
+double   g_smcOriginLow           = 0.0;   // Mínima da perna de impulso (SL agressivo de compra)
+double   g_smcOriginHigh          = 0.0;   // Máxima da perna de impulso (SL agressivo de venda)
+double   g_smcLimitPrice          = 0.0;   // Preço da ordem limite (borda do FVG)
+double   g_smcStopLoss            = 0.0;   // Stop Loss da ordem pendente
+double   g_smcTakeProfit          = 0.0;   // Take Profit da ordem pendente
+datetime g_smcChochTime           = 0;     // Tempo da vela do CHoCH (âncora da linha)
+datetime g_smcFvgTimeLeft         = 0;     // Tempo da vela esquerda do FVG (âncora do box)
+datetime g_smcUltimaBarraAvaliada = 0;     // Anti-spam: avalia a estrutura 1x por candle fechado
+ulong    g_smcPendingTicket       = 0;     // Ticket da ordem limite pendente
+int      g_smcPendingBars         = 0;     // Velas decorridas desde a colocação da ordem
+ulong    g_smcPositionTicket      = 0;     // Ticket da posição executada no reteste
 
 //+------------------------------------------------------------------+
 //| Estado de uma "perna" do Gradiente Linear (Grade Virtual).        |
@@ -199,7 +273,7 @@ CGLGrid g_glSell;  // Perna de VENDA do Grid Bidirecional
 //+------------------------------------------------------------------+
 bool InitMediaMacro()
   {
-   g_handle_ma_macro=iMA(_Symbol, PERIOD_CURRENT, InpMaMacroPeriod, 0,
+   g_handle_ma_macro=iMA(_Symbol, InpTimeFrame, InpMaMacroPeriod, 0,
                          InpMaMacroMethod, InpMaMacroAppliedPrice);
    if(g_handle_ma_macro==INVALID_HANDLE)
      {
@@ -219,7 +293,7 @@ bool InitMediaMacro()
 //+------------------------------------------------------------------+
 bool InitFimatheATR()
   {
-   g_handle_atr=iATR(_Symbol, PERIOD_CURRENT, InpFimatheATRPeriod);
+   g_handle_atr=iATR(_Symbol, InpTimeFrame, InpFimatheATRPeriod);
    if(g_handle_atr==INVALID_HANDLE)
      {
       Print("AlphaBot FIMATHE - ERRO: falha ao criar handle do ATR ",
@@ -251,31 +325,22 @@ int OnInit()
       return(INIT_FAILED);
      }
 
-//--- Trava de Segurança do Gradiente Linear: exige conta HEDGE
-   if(InpEnableGL)
+//--- Trava de Segurança do Gradiente Linear / Grid Bidirecional: exige conta HEDGE
+   if(InpEnableGL || InpBidirectionalGrid)
      {
       long modoMargem=AccountInfoInteger(ACCOUNT_MARGIN_MODE);
 
       if(modoMargem!=ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
         {
-         Alert("AlphaBot - ERRO: O Gradiente Linear exige uma conta no modo HEDGE ",
-               "(ACCOUNT_MARGIN_MODE_RETAIL_HEDGING). Modo detectado: ",
+         Alert("AlphaBot - ERRO: O Gradiente Linear / Grid Bidirecional exige uma conta ",
+               "no modo HEDGE (ACCOUNT_MARGIN_MODE_RETAIL_HEDGING). Modo detectado: ",
                EnumToString((ENUM_ACCOUNT_MARGIN_MODE)modoMargem),
-               ". Desative o Gradiente Linear (InpEnableGL=false) ou utilize uma conta Hedge. ",
+               ". Desative o Gradiente Linear e o Grid Bidirecional ou utilize uma conta Hedge. ",
                "Robô NÃO carregado.");
          Print("AlphaBot - OnInit abortado: Gradiente Linear exige conta Hedge (modo atual: ",
                EnumToString((ENUM_ACCOUNT_MARGIN_MODE)modoMargem), ").");
          return(INIT_FAILED);
         }
-     }
-
-//--- O Grid Bidirecional depende do Gradiente Linear para gerenciar as pernas
-   if(InpBidirectionalGrid && !InpEnableGL)
-     {
-      Alert("AlphaBot - ERRO: o Grid Bidirecional exige o Gradiente Linear ativo ",
-            "(InpEnableGL=true) para gerenciar as pernas de Compra e Venda. Robô NÃO carregado.");
-      Print("AlphaBot - OnInit abortado: InpBidirectionalGrid=true com InpEnableGL=false.");
-      return(INIT_FAILED);
      }
 
 //--- As pernas de compra e venda NÃO podem compartilhar o mesmo Magic de reentrada
@@ -310,7 +375,7 @@ int OnInit()
      }
 
 //--- Validação dos parâmetros do Motor de Sinal Fimathe
-   if(InpEntrySignalType == SIGNAL_FIMATHE)
+   if(InpSignalType == SIGNAL_FIMATHE)
      {
       if(InpFimatheCalcType == FIMATHE_USE_ATR)
         {
@@ -345,7 +410,7 @@ int OnInit()
      }
 
 //--- Validação dos parâmetros da Armadilha de Liquidez / Wyckoff
-   if(InpEntrySignalType == SIGNAL_TRAP)
+   if(InpSignalType == SIGNAL_TRAP)
      {
       if(InpTrapLookback < 2 || InpTrapVolMAPeriod < 2 ||
          InpTrapVolMultiplier <= 0.0 || InpTrapRiskReward <= 0.0 ||
@@ -362,6 +427,37 @@ int OnInit()
                " | buffer=", DoubleToString(InpTrapStopBufferPips, 2), ").");
          return(INIT_FAILED);
         }
+     }
+
+//--- Validação dos parâmetros do Motor SMC (CHoCH + FVG)
+   if(InpSignalType == SIGNAL_SMC)
+     {
+      if(InpSMC_SwingBars < 1 || InpSMC_MinFVGPips < 0.0 || InpSMC_RiskReward <= 0.0 ||
+         InpSMC_ConservativeSLPips <= 0.0 || InpSMC_SLBufferPips < 0.0 || InpSMC_MaxBarsPending < 1)
+        {
+         Alert("AlphaBot - ERRO: parâmetros inválidos do Motor SMC. ",
+               "Exige InpSMC_SwingBars >= 1, InpSMC_MinFVGPips >= 0, InpSMC_RiskReward > 0, ",
+               "InpSMC_ConservativeSLPips > 0, InpSMC_SLBufferPips >= 0 e InpSMC_MaxBarsPending >= 1. ",
+               "Robô NÃO carregado.");
+         Print("AlphaBot - OnInit abortado: SMC inválido (SwingBars=",
+               InpSMC_SwingBars, " | MinFVG=", DoubleToString(InpSMC_MinFVGPips, 2),
+               " | RR=", DoubleToString(InpSMC_RiskReward, 2),
+               " | SLcons=", DoubleToString(InpSMC_ConservativeSLPips, 2),
+               " | buffer=", DoubleToString(InpSMC_SLBufferPips, 2),
+               " | maxBars=", InpSMC_MaxBarsPending, ").");
+         return(INIT_FAILED);
+        }
+     }
+
+//--- Validação dos FILTROS GLOBAIS
+   if(InpUseFiltroHorario && (InpHoraInicio < 0 || InpHoraInicio > 23 ||
+                              InpHoraFim < 0 || InpHoraFim > 23))
+     {
+      Alert("AlphaBot - ERRO: Filtro de Horário inválido. ",
+            "As horas de início/fim devem estar entre 0 e 23. Robô NÃO carregado.");
+      Print("AlphaBot - OnInit abortado: filtro horário inválido (inicio=",
+            InpHoraInicio, " | fim=", InpHoraFim, ").");
+      return(INIT_FAILED);
      }
 
 //--- Configuração do objeto de execução
@@ -391,8 +487,17 @@ int OnInit()
 
    Print("AlphaBot - Padrões ativos -> Martelo: ", (InpUseHammer ? "ON" : "OFF"),
          " | Engolfo: ", (InpUseEngulfing ? "ON" : "OFF"), ".");
-   Print("AlphaBot - Motor de Sinal de Entrada: ", EnumToString(InpEntrySignalType), ".");
-   if(InpEntrySignalType == SIGNAL_FIMATHE)
+   Print("AlphaBot - Motor de Sinal de Entrada: ", EnumToString(InpSignalType), ".");
+   Print("AlphaBot - Timeframe Operacional: ",
+         (InpTimeFrame == PERIOD_CURRENT ? "PERIOD_CURRENT (gráfico: "
+                                           + EnumToString((ENUM_TIMEFRAMES)Period()) + ")"
+                                         : EnumToString(InpTimeFrame)), ".");
+   Print("AlphaBot - FILTROS GLOBAIS -> Média Móvel: ",
+         (InpUseFiltroMediaMovel ? "ON (" + IntegerToString(InpMaMacroPeriod) + ")" : "OFF"),
+         " | Horário: ",
+         (InpUseFiltroHorario ? "ON (" + IntegerToString(InpHoraInicio) + "h-"
+                                + IntegerToString(InpHoraFim) + "h)" : "OFF"), ".");
+   if(InpSignalType == SIGNAL_FIMATHE)
      {
       if(InpFimatheCalcType == FIMATHE_USE_ATR)
          Print("AlphaBot FIMATHE - Cálculo=ATR (período=", InpFimatheATRPeriod,
@@ -405,12 +510,21 @@ int OnInit()
             " | Reversão (Virar a Mão)=",
             (InpAllowFimatheReversal ? "ON" : "OFF"), ".");
      }
-   if(InpEntrySignalType == SIGNAL_TRAP)
+   if(InpSignalType == SIGNAL_TRAP)
       Print("AlphaBot ARMADILHA - Lookback=", InpTrapLookback,
             " | VolMA=", InpTrapVolMAPeriod,
             " | VolMult=", DoubleToString(InpTrapVolMultiplier, 2),
             " | R:R=", DoubleToString(InpTrapRiskReward, 2),
             " | Buffer(pips)=", DoubleToString(InpTrapStopBufferPips, 2), ".");
+   if(InpSignalType == SIGNAL_SMC)
+      Print("AlphaBot SMC - SwingBars=", InpSMC_SwingBars,
+            " | FVG mín(pips)=", DoubleToString(InpSMC_MinFVGPips, 2),
+            " | SL=", EnumToString(InpSMC_SLType),
+            " | R:R=", DoubleToString(InpSMC_RiskReward, 2),
+            " | SLcons(pips)=", DoubleToString(InpSMC_ConservativeSLPips, 2),
+            " | buffer(pips)=", DoubleToString(InpSMC_SLBufferPips, 2),
+            " | maxBarsPend=", InpSMC_MaxBarsPending,
+            " | Visuais=", (InpSMC_DrawVisuals ? "ON" : "OFF"), ".");
    Print("AlphaBot - Ação em sinal oposto: ", EnumToString(InpOppositeAction), ".");
    Print("AlphaBot - Gradiente Linear: ", (InpEnableGL ? "ATIVO" : "INATIVO"),
          " (níveis SL=", InpLevelsSL, " | níveis TP=", InpLevelsTP,
@@ -449,6 +563,9 @@ void OnDeinit(const int reason)
 
 //--- Remove as linhas do Fimathe ao remover o robô / trocar de timeframe
    ClearFimatheChannels();
+
+//--- Remove os objetos gráficos do Motor SMC
+   SMC_ClearVisuals();
 
    Print("AlphaBot - Desinicializado. Código de motivo: ", reason);
   }
@@ -579,93 +696,125 @@ bool IsBearishEngulfing(const MqlRates &candle1, const MqlRates &candle2)
   }
 
 //+------------------------------------------------------------------+
-//| Avalia o price action do candle [1] + filtro de tendência macro. |
-//| Compra (Martelo) exige Preço > Média Macro.                      |
-//| Venda (Martelo Invertido) exige Preço < Média Macro.             |
+//| Avalia APENAS o price action do candle [1] (Martelo / Engolfo).   |
+//| O filtro de tendência macro agora é GLOBAL e aplicado a todas as  |
+//| estratégias por CheckGlobalFilters().                             |
 //+------------------------------------------------------------------+
 ENUM_ALPHA_SIGNAL CheckPriceActionSignal()
   {
-   if(g_handle_ma_macro==INVALID_HANDLE)
-     {
-      Print("AlphaBot - ERRO: CheckPriceActionSignal sem handle da Média Macro.");
-      return(SIGNAL_NONE);
-     }
-
-   if(Bars(_Symbol, PERIOD_CURRENT) < InpMaMacroPeriod + 3)
-     {
-      Print("AlphaBot - AVISO: barras insuficientes (",
-            Bars(_Symbol, PERIOD_CURRENT), ") para a Média Macro ",
-            InpMaMacroPeriod, ".");
-      return(SIGNAL_NONE);
-     }
-
 //--- Candles [1] e [2]. ArraySetAsSeries garante rates[0]=candle[1], rates[1]=candle[2]
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
-   if(CopyRates(_Symbol, PERIOD_CURRENT, 1, 2, rates) != 2)
+   if(CopyRates(_Symbol, InpTimeFrame, 1, 2, rates) != 2)
      {
       Print("AlphaBot - ERRO: CopyRates retornou ", GetLastError(), ".");
       return(SIGNAL_NONE);
      }
 
-//--- Valor da Média Macro no candle [1]
-   double ma[];
-   if(CopyBuffer(g_handle_ma_macro, 0, 1, 1, ma) != 1)
-     {
-      Print("AlphaBot - ERRO: CopyBuffer(Média Macro) retornou ", GetLastError(), ".");
-      return(SIGNAL_NONE);
-     }
-
-   double fechamento = rates[0].close;
-   double valorMa    = ma[0];
-
-//--- Gatilho de COMPRA: (Martelo OU Engolfo de Alta, se habilitados) + preço acima da Média Macro
+//--- Gatilho de COMPRA: Martelo OU Engolfo de Alta (se habilitados)
    bool marteloCompra = InpUseHammer    && IsHammer(rates[0]);
    bool engolfoCompra = InpUseEngulfing && IsBullishEngulfing(rates[0], rates[1]);
 
    if(marteloCompra || engolfoCompra)
      {
       g_signalPadrao = (marteloCompra ? "Martelo" : "Engolfo de Alta");
-
-      if(fechamento > valorMa)
-        {
-         Print("SINAL DE COMPRA VALIDADO: ", g_signalPadrao, " detectado E Preço (",
-               DoubleToString(fechamento, _Digits), ") > Média Macro (",
-               DoubleToString(valorMa, _Digits), ")");
-         return(SIGNAL_BUY);
-        }
-
-      Print("SINAL DE COMPRA REJEITADO: ", g_signalPadrao, " detectado, mas Preço está ",
-            "abaixo da Média Macro (Contra-tendência). Preço=",
-            DoubleToString(fechamento, _Digits), " | Média Macro=",
-            DoubleToString(valorMa, _Digits));
-      return(SIGNAL_NONE);
+      Print("SINAL DE COMPRA DETECTADO [PRICE ACTION]: ", g_signalPadrao, ".");
+      return(SIGNAL_BUY);
      }
 
-//--- Gatilho de VENDA: (Martelo Invertido OU Engolfo de Baixa, se habilitados) + preço abaixo da Média Macro
+//--- Gatilho de VENDA: Martelo Invertido OU Engolfo de Baixa (se habilitados)
    bool marteloInvertido = InpUseHammer    && IsInvertedHammer(rates[0]);
    bool engolfoBaixa     = InpUseEngulfing && IsBearishEngulfing(rates[0], rates[1]);
 
    if(marteloInvertido || engolfoBaixa)
      {
       g_signalPadrao = (marteloInvertido ? "Martelo Invertido" : "Engolfo de Baixa");
-
-      if(fechamento < valorMa)
-        {
-         Print("SINAL DE VENDA VALIDADO: ", g_signalPadrao, " detectado E Preço (",
-               DoubleToString(fechamento, _Digits), ") < Média Macro (",
-               DoubleToString(valorMa, _Digits), ")");
-         return(SIGNAL_SELL);
-        }
-
-      Print("SINAL DE VENDA REJEITADO: ", g_signalPadrao, " detectado, mas Preço está ",
-            "acima da Média Macro (Contra-tendência). Preço=",
-            DoubleToString(fechamento, _Digits), " | Média Macro=",
-            DoubleToString(valorMa, _Digits));
-      return(SIGNAL_NONE);
+      Print("SINAL DE VENDA DETECTADO [PRICE ACTION]: ", g_signalPadrao, ".");
+      return(SIGNAL_SELL);
      }
 
    return(SIGNAL_NONE);
+  }
+
+//+==================================================================+
+//| FILTROS GLOBAIS (bloqueiam entradas de QUALQUER estratégia)       |
+//|   - Filtro de Média Móvel Macro (direcional)                      |
+//|   - Filtro de Horário (janela de operação, hora do servidor)      |
+//| Retorna true se a entrada PODE ser executada.                     |
+//+==================================================================+
+bool CheckGlobalFilters(const ENUM_ALPHA_SIGNAL sinal)
+  {
+   if(sinal == SIGNAL_NONE)
+      return(false);
+
+   int direcao = (sinal == SIGNAL_BUY) ? 1 : -1;
+
+//--- FILTRO DE HORÁRIO
+   if(InpUseFiltroHorario)
+     {
+      MqlDateTime dt;
+      TimeToStruct(TimeCurrent(), dt);
+      int hora = dt.hour;
+
+      bool dentro;
+      if(InpHoraInicio <= InpHoraFim)
+         dentro = (hora >= InpHoraInicio && hora < InpHoraFim);
+      else //--- janela que cruza a meia-noite
+         dentro = (hora >= InpHoraInicio || hora < InpHoraFim);
+
+      if(!dentro)
+        {
+         Print("AlphaBot - ENTRADA BLOQUEADA [FILTRO HORÁRIO]: hora atual ", hora,
+               "h fora da janela [", InpHoraInicio, "h ; ", InpHoraFim, "h).");
+         return(false);
+        }
+     }
+
+//--- FILTRO DE MÉDIA MÓVEL MACRO (direcional)
+   if(InpUseFiltroMediaMovel)
+     {
+      if(g_handle_ma_macro == INVALID_HANDLE)
+        {
+         Print("AlphaBot - ENTRADA BLOQUEADA [FILTRO MM]: handle da Média Macro inválido.");
+         return(false);
+        }
+
+      if(Bars(_Symbol, InpTimeFrame) < InpMaMacroPeriod + 3)
+        {
+         Print("AlphaBot - ENTRADA BLOQUEADA [FILTRO MM]: barras insuficientes (",
+               Bars(_Symbol, InpTimeFrame), ") para a Média Macro ", InpMaMacroPeriod, ".");
+         return(false);
+        }
+
+      double ma[];
+      if(CopyBuffer(g_handle_ma_macro, 0, 0, 1, ma) != 1)
+        {
+         Print("AlphaBot - ENTRADA BLOQUEADA [FILTRO MM]: CopyBuffer retornou ",
+               GetLastError(), ".");
+         return(false);
+        }
+
+      double preco = (direcao == 1) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                                    : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+      if(direcao == 1 && preco <= ma[0])
+        {
+         Print("AlphaBot - ENTRADA BLOQUEADA [FILTRO MM]: COMPRA exige Preço (",
+               DoubleToString(preco, _Digits), ") > Média Macro (",
+               DoubleToString(ma[0], _Digits), ").");
+         return(false);
+        }
+
+      if(direcao == -1 && preco >= ma[0])
+        {
+         Print("AlphaBot - ENTRADA BLOQUEADA [FILTRO MM]: VENDA exige Preço (",
+               DoubleToString(preco, _Digits), ") < Média Macro (",
+               DoubleToString(ma[0], _Digits), ").");
+         return(false);
+        }
+     }
+
+   return(true);
   }
 
 //+==================================================================+
@@ -733,7 +882,7 @@ void DrawFimatheChannels(const double crTopo, const double crBottom, const doubl
                               : "FIMATHE: Topo ZN (Gatilho de COMPRA)"));
 
 //--- Rótulos das regiões, ancorados próximos ao candle atual (lado direito)
-   datetime tempoAncora = iTime(_Symbol, PERIOD_CURRENT, 0);
+   datetime tempoAncora = iTime(_Symbol, InpTimeFrame, 0);
    double   meioCR      = (crTopo + crBottom) / 2.0;
    double   meioZN      = (crBottom + znOuter) / 2.0;
 
@@ -830,7 +979,7 @@ bool FimatheDefinirCanais()
          return(false);
         }
 
-      if(Bars(_Symbol, PERIOD_CURRENT) < InpFimatheATRPeriod + 5)
+      if(Bars(_Symbol, InpTimeFrame) < InpFimatheATRPeriod + 5)
          return(false);
 
       double atr[];
@@ -847,7 +996,7 @@ bool FimatheDefinirCanais()
 
       MqlRates rates[];
       ArraySetAsSeries(rates, true);
-      if(CopyRates(_Symbol, PERIOD_CURRENT, 0, 2, rates) != 2)
+      if(CopyRates(_Symbol, InpTimeFrame, 0, 2, rates) != 2)
         {
          Print("AlphaBot FIMATHE - ERRO: CopyRates retornou ", GetLastError(), ".");
          return(false);
@@ -867,12 +1016,12 @@ bool FimatheDefinirCanais()
          return(false);
         }
 
-      if(Bars(_Symbol, PERIOD_CURRENT) < InpFimatheSwingBars + 2)
+      if(Bars(_Symbol, InpTimeFrame) < InpFimatheSwingBars + 2)
          return(false);
 
       //--- Maior máxima e menor mínima dos últimos N candles (exclui a vela atual)
-      int shiftHigh = iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, InpFimatheSwingBars, 1);
-      int shiftLow  = iLowest(_Symbol, PERIOD_CURRENT, MODE_LOW, InpFimatheSwingBars, 1);
+      int shiftHigh = iHighest(_Symbol, InpTimeFrame, MODE_HIGH, InpFimatheSwingBars, 1);
+      int shiftLow  = iLowest(_Symbol, InpTimeFrame, MODE_LOW, InpFimatheSwingBars, 1);
 
       if(shiftHigh < 0 || shiftLow < 0)
         {
@@ -880,8 +1029,8 @@ bool FimatheDefinirCanais()
          return(false);
         }
 
-      double highest = iHigh(_Symbol, PERIOD_CURRENT, shiftHigh);
-      double lowest  = iLow(_Symbol, PERIOD_CURRENT, shiftLow);
+      double highest = iHigh(_Symbol, InpTimeFrame, shiftHigh);
+      double lowest  = iLow(_Symbol, InpTimeFrame, shiftLow);
 
       channelHeight = highest - lowest;
       if(channelHeight <= 0.0)
@@ -964,7 +1113,7 @@ ENUM_ALPHA_SIGNAL CheckFimatheSignal()
 //--- rates[0] = candle atual | rates[1] = candle de sinal | rates[2] = candle anterior
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
-   if(CopyRates(_Symbol, PERIOD_CURRENT, 0, 3, rates) != 3)
+   if(CopyRates(_Symbol, InpTimeFrame, 0, 3, rates) != 3)
      {
       Print("AlphaBot FIMATHE - ERRO: CopyRates retornou ", GetLastError(), ".");
       return(SIGNAL_NONE);
@@ -1050,40 +1199,40 @@ ENUM_ALPHA_SIGNAL CheckTrapSignal()
       return(SIGNAL_NONE);
 
 //--- Avalia apenas UMA vez por candle fechado (evita reavaliação por tick)
-   datetime barraSinal = iTime(_Symbol, PERIOD_CURRENT, 1);
+   datetime barraSinal = iTime(_Symbol, InpTimeFrame, 1);
    if(barraSinal == 0 || barraSinal == g_trapUltimaBarraAvaliada)
       return(SIGNAL_NONE);
    g_trapUltimaBarraAvaliada = barraSinal;
 
 //--- Barras suficientes para suporte/resistência + média de volume
-   if(Bars(_Symbol, PERIOD_CURRENT) < InpTrapLookback + InpTrapVolMAPeriod + 3)
+   if(Bars(_Symbol, InpTimeFrame) < InpTrapLookback + InpTrapVolMAPeriod + 3)
       return(SIGNAL_NONE);
 
 //--- A) Níveis de liquidez: menor mínima e maior máxima (i = 2 .. 1 + lookback)
-   int shiftHigh = iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, InpTrapLookback, 2);
-   int shiftLow  = iLowest(_Symbol, PERIOD_CURRENT, MODE_LOW, InpTrapLookback, 2);
+   int shiftHigh = iHighest(_Symbol, InpTimeFrame, MODE_HIGH, InpTrapLookback, 2);
+   int shiftLow  = iLowest(_Symbol, InpTimeFrame, MODE_LOW, InpTrapLookback, 2);
    if(shiftHigh < 0 || shiftLow < 0)
       return(SIGNAL_NONE);
 
-   double resistanceLevel = iHigh(_Symbol, PERIOD_CURRENT, shiftHigh);
-   double supportLevel    = iLow(_Symbol, PERIOD_CURRENT, shiftLow);
+   double resistanceLevel = iHigh(_Symbol, InpTimeFrame, shiftHigh);
+   double supportLevel    = iLow(_Symbol, InpTimeFrame, shiftLow);
 
 //--- B) Média móvel simples do volume (i = 2 .. 1 + InpTrapVolMAPeriod)
    double volSum = 0.0;
    for(int i = 2; i <= 1 + InpTrapVolMAPeriod; i++)
-      volSum += (double)iVolume(_Symbol, PERIOD_CURRENT, i);
+      volSum += (double)iVolume(_Symbol, InpTimeFrame, i);
 
    double volMA = volSum / (double)InpTrapVolMAPeriod;
    if(volMA <= 0.0)
       return(SIGNAL_NONE);
 
-   double vol1 = (double)iVolume(_Symbol, PERIOD_CURRENT, 1);
+   double vol1 = (double)iVolume(_Symbol, InpTimeFrame, 1);
    bool   isHighVolume = (vol1 >= volMA * InpTrapVolMultiplier);
 
 //--- Dados da vela de sinal
-   double low1   = iLow(_Symbol, PERIOD_CURRENT, 1);
-   double high1  = iHigh(_Symbol, PERIOD_CURRENT, 1);
-   double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+   double low1   = iLow(_Symbol, InpTimeFrame, 1);
+   double high1  = iHigh(_Symbol, InpTimeFrame, 1);
+   double close1 = iClose(_Symbol, InpTimeFrame, 1);
 
    double pip    = TrapPipSize();
    double buffer = InpTrapStopBufferPips * pip;
@@ -1123,19 +1272,627 @@ ENUM_ALPHA_SIGNAL CheckTrapSignal()
    return(SIGNAL_NONE);
   }
 
+//+==================================================================+
+//|          MOTOR SMC - SMART MONEY CONCEPTS (CHoCH + FVG)           |
+//|                                                                    |
+//| MÁQUINA DE ESTADOS (reteste institucional):                        |
+//|   IDLE               -> mapeia estrutura (fractais) e aguarda CHoCH |
+//|   AGUARDANDO_RETESTE -> CHoCH + FVG confirmados; ordem LIMITE na    |
+//|                         borda do FVG aguardando o preço corrigir   |
+//|   EM_TRADE           -> ordem executada; SL/TP nativos gerenciam    |
+//|                                                                    |
+//| Hierarquia obrigatória:                                            |
+//|   1) Tendência de BAIXA (topos/fundos descendentes): aguarda o      |
+//|      rompimento do último TOPO válido -> CHoCH Bullish (compra).    |
+//|   2) Tendência de ALTA (topos/fundos ascendentes): aguarda o        |
+//|      rompimento do último FUNDO válido -> CHoCH Bearish (venda).    |
+//|   3) O CHoCH NÃO entra a mercado: apenas arma a ordem limite.       |
+//|   4) Compra: Buy Limit no TOPO do box verde do FVG.                 |
+//|      Venda : Sell Limit no FUNDO do box vermelho do FVG.            |
+//|   5) FVGs minúsculos ou já totalmente mitigados são descartados.    |
+//+==================================================================+
+
+//+------------------------------------------------------------------+
+//| Tamanho de 1 pip conforme os dígitos do símbolo (SMC).            |
+//+------------------------------------------------------------------+
+double SMC_PipSize()
+  {
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   if(digits == 3 || digits == 5)
+      return(10.0 * _Point);
+   return(_Point);
+  }
+
+//+------------------------------------------------------------------+
+//| Mapeia a ESTRUTURA por FRACTAL: retorna os 2 últimos topos e os 2  |
+//| últimos fundos válidos (mais recente e anterior). Um fractal exige |
+//| InpSMC_SwingBars velas menores à esquerda e à direita.            |
+//+------------------------------------------------------------------+
+bool SMC_MapStructure(double &sh1, double &sh2, double &sl1, double &sl2)
+  {
+   sh1 = 0.0;
+   sh2 = 0.0;
+   sl1 = 0.0;
+   sl2 = 0.0;
+
+   int bars    = Bars(_Symbol, InpTimeFrame);
+   int maxScan = InpSMC_SwingBars * 16 + 30;
+
+   if(maxScan > bars - InpSMC_SwingBars - 2)
+      maxScan = bars - InpSMC_SwingBars - 2;
+
+   if(maxScan < InpSMC_SwingBars + 1)
+      return(false);
+
+   int need = maxScan + InpSMC_SwingBars + 1;
+   if(need > bars)
+      need = bars;
+
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   if(CopyRates(_Symbol, InpTimeFrame, 0, need, rates) != need)
+      return(false);
+
+   int nTopo  = 0;
+   int nFundo = 0;
+
+   for(int i = InpSMC_SwingBars + 1; i <= maxScan && (nTopo < 2 || nFundo < 2); i++)
+     {
+      if(nTopo < 2)
+        {
+         bool topo = true;
+         for(int k = 1; k <= InpSMC_SwingBars; k++)
+            if(rates[i].high < rates[i - k].high || rates[i].high < rates[i + k].high)
+              {
+               topo = false;
+               break;
+              }
+         if(topo)
+           {
+            if(nTopo == 0)
+               sh1 = rates[i].high;
+            else
+               sh2 = rates[i].high;
+            nTopo++;
+           }
+        }
+
+      if(nFundo < 2)
+        {
+         bool fundo = true;
+         for(int k = 1; k <= InpSMC_SwingBars; k++)
+            if(rates[i].low > rates[i - k].low || rates[i].low > rates[i + k].low)
+              {
+               fundo = false;
+               break;
+              }
+         if(fundo)
+           {
+            if(nFundo == 0)
+               sl1 = rates[i].low;
+            else
+               sl2 = rates[i].low;
+            nFundo++;
+           }
+        }
+     }
+
+   return(nTopo >= 2 && nFundo >= 2);
+  }
+
+//+------------------------------------------------------------------+
+//| Reinicia todo o ciclo SMC: cancela a ordem pendente, zera o estado |
+//| e remove os objetos gráficos.                                     |
+//+------------------------------------------------------------------+
+void SMC_ResetCiclo(const string motivo)
+  {
+   SMC_CancelPending(motivo);
+
+   g_smcEstado         = SMC_STATE_IDLE;
+   g_smcDirecao        = 0;
+   g_smcChochLevel     = 0.0;
+   g_smcFvgTop         = 0.0;
+   g_smcFvgBottom      = 0.0;
+   g_smcOriginLow      = 0.0;
+   g_smcOriginHigh     = 0.0;
+   g_smcLimitPrice     = 0.0;
+   g_smcStopLoss       = 0.0;
+   g_smcTakeProfit     = 0.0;
+   g_smcChochTime      = 0;
+   g_smcFvgTimeLeft    = 0;
+   g_smcPendingBars    = 0;
+   g_smcPositionTicket = 0;
+
+   SMC_ClearVisuals();
+  }
+
+//+------------------------------------------------------------------+
+//| Remove todos os objetos gráficos do Motor SMC.                    |
+//+------------------------------------------------------------------+
+void SMC_ClearVisuals()
+  {
+   ObjectsDeleteAll(0, SMC_PREFIX);
+  }
+
+//+------------------------------------------------------------------+
+//| Desenha a linha do CHoCH (tracejada) e o Box do FVG detectado.    |
+//+------------------------------------------------------------------+
+void SMC_DrawSetup()
+  {
+   if(!InpSMC_DrawVisuals)
+      return;
+
+   ChartSetInteger(0, CHART_SHOW_OBJECT_DESCR, true);
+
+   datetime tAtual = iTime(_Symbol, InpTimeFrame, 0);
+   color    cor    = (g_smcDirecao == 1 ? clrLimeGreen : clrTomato);
+
+//--- Linha de tendência horizontal (tracejada) no nível do CHoCH
+   string nomeLinha = SMC_PREFIX + "CHoCH_Line";
+   if(ObjectFind(0, nomeLinha) < 0)
+      ObjectCreate(0, nomeLinha, OBJ_TREND, 0,
+                   g_smcChochTime, g_smcChochLevel, tAtual, g_smcChochLevel);
+   ObjectSetInteger(0, nomeLinha, OBJPROP_TIME,  0, g_smcChochTime);
+   ObjectSetDouble (0, nomeLinha, OBJPROP_PRICE, 0, g_smcChochLevel);
+   ObjectSetInteger(0, nomeLinha, OBJPROP_TIME,  1, tAtual);
+   ObjectSetDouble (0, nomeLinha, OBJPROP_PRICE, 1, g_smcChochLevel);
+   ObjectSetInteger(0, nomeLinha, OBJPROP_COLOR, cor);
+   ObjectSetInteger(0, nomeLinha, OBJPROP_STYLE, STYLE_DASH);
+   ObjectSetInteger(0, nomeLinha, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, nomeLinha, OBJPROP_RAY_RIGHT, false);
+   ObjectSetInteger(0, nomeLinha, OBJPROP_BACK, false);
+   ObjectSetInteger(0, nomeLinha, OBJPROP_SELECTABLE, false);
+   ObjectSetString (0, nomeLinha, OBJPROP_TEXT, "CHoCH Line");
+
+//--- Box (retângulo) destacando a zona do FVG
+   string nomeBox = SMC_PREFIX + "FVG_Box";
+   if(ObjectFind(0, nomeBox) < 0)
+      ObjectCreate(0, nomeBox, OBJ_RECTANGLE, 0,
+                   g_smcFvgTimeLeft, g_smcFvgTop, tAtual, g_smcFvgBottom);
+   ObjectSetInteger(0, nomeBox, OBJPROP_TIME,  0, g_smcFvgTimeLeft);
+   ObjectSetDouble (0, nomeBox, OBJPROP_PRICE, 0, g_smcFvgTop);
+   ObjectSetInteger(0, nomeBox, OBJPROP_TIME,  1, tAtual);
+   ObjectSetDouble (0, nomeBox, OBJPROP_PRICE, 1, g_smcFvgBottom);
+   ObjectSetInteger(0, nomeBox, OBJPROP_COLOR, cor);
+   ObjectSetInteger(0, nomeBox, OBJPROP_FILL, true);
+   ObjectSetInteger(0, nomeBox, OBJPROP_BACK, true);
+   ObjectSetInteger(0, nomeBox, OBJPROP_SELECTABLE, false);
+   ObjectSetString (0, nomeBox, OBJPROP_TEXT, "FVG Zone");
+  }
+
+//+------------------------------------------------------------------+
+//| Plota o label de auditoria na vela de entrada do setup SMC.       |
+//+------------------------------------------------------------------+
+void SMC_DrawEntryLabel(const int direcao, const datetime tempo, const double preco)
+  {
+   if(!InpSMC_DrawVisuals)
+      return;
+
+   string nomeTxt = SMC_PREFIX + "Entry_Label";
+   if(ObjectFind(0, nomeTxt) < 0)
+      ObjectCreate(0, nomeTxt, OBJ_TEXT, 0, tempo, preco);
+
+   ObjectSetInteger(0, nomeTxt, OBJPROP_TIME,  0, tempo);
+   ObjectSetDouble (0, nomeTxt, OBJPROP_PRICE, 0, preco);
+   ObjectSetInteger(0, nomeTxt, OBJPROP_ANCHOR,
+                    (direcao == 1 ? ANCHOR_LEFT_LOWER : ANCHOR_LEFT_UPPER));
+   ObjectSetInteger(0, nomeTxt, OBJPROP_COLOR,
+                    (direcao == 1 ? clrLimeGreen : clrTomato));
+   ObjectSetInteger(0, nomeTxt, OBJPROP_FONTSIZE, 9);
+   ObjectSetString (0, nomeTxt, OBJPROP_FONT, "Arial Bold");
+   ObjectSetInteger(0, nomeTxt, OBJPROP_SELECTABLE, false);
+   ObjectSetString (0, nomeTxt, OBJPROP_TEXT,
+                    "Motivo: Toque no FVG apos CHoCH (" +
+                    string(direcao == 1 ? "Compra" : "Venda") + ")");
+  }
+
+//+------------------------------------------------------------------+
+//| Existe alguma posição aberta deste robô no símbolo? (magic SMC)   |
+//+------------------------------------------------------------------+
+bool SMC_ExistePosicao()
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
+
+      g_smcPositionTicket = ticket;
+      return(true);
+     }
+
+   return(false);
+  }
+
+//+------------------------------------------------------------------+
+//| Existe ordem LIMITE pendente deste robô no símbolo?               |
+//+------------------------------------------------------------------+
+bool SMC_OrdemPendenteViva()
+  {
+   if(g_smcPendingTicket != 0 && OrderSelect(g_smcPendingTicket))
+      return(true);
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol)
+         continue;
+
+      if((long)OrderGetInteger(ORDER_MAGIC) != InpMagicNumber)
+         continue;
+
+      g_smcPendingTicket = ticket;
+      return(true);
+     }
+
+   return(false);
+  }
+
+//+------------------------------------------------------------------+
+//| Cancela a ordem limite pendente do ciclo SMC.                     |
+//+------------------------------------------------------------------+
+void SMC_CancelPending(const string motivo)
+  {
+   if(g_smcPendingTicket != 0 && OrderSelect(g_smcPendingTicket))
+     {
+      if(trade.OrderDelete(g_smcPendingTicket))
+         Print("[SMC] Ordem pendente cancelada (", motivo,
+               ") | ticket=", g_smcPendingTicket, ".");
+      else
+         Print("[SMC] ERRO ao cancelar ordem ", g_smcPendingTicket, " (", motivo,
+               "). Retcode=", trade.ResultRetcode(),
+               " (", trade.ResultRetcodeDescription(), ").");
+     }
+
+   g_smcPendingTicket = 0;
+  }
+
+//+------------------------------------------------------------------+
+//| Procura um novo setup SMC (CHoCH + FVG) no candle fechado [1].    |
+//| Exige contexto de tendência: baixa para CHoCH de alta e alta para |
+//| CHoCH de baixa. O CHoCH apenas ARMA o setup (não entra a mercado).|
+//+------------------------------------------------------------------+
+bool SMC_ArmarSetup()
+  {
+   double sh1 = 0.0, sh2 = 0.0, sl1 = 0.0, sl2 = 0.0;
+   if(!SMC_MapStructure(sh1, sh2, sl1, sl2))
+      return(false);
+
+   bool tendenciaBaixa = (sh1 < sh2 && sl1 < sl2); // topos e fundos descendentes
+   bool tendenciaAlta  = (sh1 > sh2 && sl1 > sl2); // topos e fundos ascendentes
+
+   if(!tendenciaBaixa && !tendenciaAlta)
+      return(false);
+
+   if(Bars(_Symbol, InpTimeFrame) < 5)
+      return(false);
+
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   if(CopyRates(_Symbol, InpTimeFrame, 0, 4, rates) != 4)
+      return(false);
+
+   double pip    = SMC_PipSize();
+   double minGap = InpSMC_MinFVGPips * pip;
+
+//--- CHoCH de ALTA (reversão de baixa): fecha acima do último topo válido
+   if(tendenciaBaixa && rates[1].close > sh1 && rates[2].close <= sh1)
+     {
+      double gap = rates[1].low - rates[3].high; // V1 (recente) x V3 (antiga)
+      if(gap >= minGap)
+        {
+         double fvgBottom = rates[3].high;
+         double fvgTop    = rates[1].low;
+
+         //--- Mitigação: se o preço já preencheu todo o box, descarta o setup
+         if(iLow(_Symbol, InpTimeFrame, 0) <= fvgBottom)
+           {
+            Print("[SMC] FVG de alta descartado: zona já totalmente mitigada.");
+            return(false);
+           }
+
+         g_smcDirecao     = 1;
+         g_smcChochLevel  = sh1;
+         g_smcFvgBottom   = fvgBottom;
+         g_smcFvgTop      = fvgTop;
+         g_smcOriginLow   = MathMin(rates[1].low, MathMin(rates[2].low, rates[3].low));
+         g_smcOriginHigh  = MathMax(rates[1].high, MathMax(rates[2].high, rates[3].high));
+         g_smcChochTime   = rates[1].time;
+         g_smcFvgTimeLeft = rates[3].time;
+
+         Print("[SMC] CHoCH de ALTA confirmado (tendência de baixa rompida): fechamento ",
+               DoubleToString(rates[1].close, _Digits), " > Topo ", DoubleToString(sh1, _Digits),
+               " | FVG de alta [", DoubleToString(fvgBottom, _Digits), " ; ",
+               DoubleToString(fvgTop, _Digits), "] (", DoubleToString(gap / pip, 1),
+               " pips). Estado -> AGUARDANDO_RETESTE.");
+         return(true);
+        }
+      return(false);
+     }
+
+//--- CHoCH de BAIXA (reversão de alta): fecha abaixo do último fundo válido
+   if(tendenciaAlta && rates[1].close < sl1 && rates[2].close >= sl1)
+     {
+      double gap = rates[3].low - rates[1].high; // V3 (antiga) x V1 (recente)
+      if(gap >= minGap)
+        {
+         double fvgBottom = rates[1].high;
+         double fvgTop    = rates[3].low;
+
+         if(iHigh(_Symbol, InpTimeFrame, 0) >= fvgTop)
+           {
+            Print("[SMC] FVG de baixa descartado: zona já totalmente mitigada.");
+            return(false);
+           }
+
+         g_smcDirecao     = -1;
+         g_smcChochLevel  = sl1;
+         g_smcFvgBottom   = fvgBottom;
+         g_smcFvgTop      = fvgTop;
+         g_smcOriginLow   = MathMin(rates[1].low, MathMin(rates[2].low, rates[3].low));
+         g_smcOriginHigh  = MathMax(rates[1].high, MathMax(rates[2].high, rates[3].high));
+         g_smcChochTime   = rates[1].time;
+         g_smcFvgTimeLeft = rates[3].time;
+
+         Print("[SMC] CHoCH de BAIXA confirmado (tendência de alta rompida): fechamento ",
+               DoubleToString(rates[1].close, _Digits), " < Fundo ", DoubleToString(sl1, _Digits),
+               " | FVG de baixa [", DoubleToString(fvgBottom, _Digits), " ; ",
+               DoubleToString(fvgTop, _Digits), "] (", DoubleToString(gap / pip, 1),
+               " pips). Estado -> AGUARDANDO_RETESTE.");
+         return(true);
+        }
+      return(false);
+     }
+
+   return(false);
+  }
+
+//+------------------------------------------------------------------+
+//| Calcula preço-limite (borda do FVG), Stop Loss e Take Profit.      |
+//| Compra: limite no TOPO do box verde; Venda: no FUNDO do box vermelho.|
+//| SL: conservador (pips fixos) ou agressivo (além da vela do FVG).   |
+//+------------------------------------------------------------------+
+bool SMC_ComputeOrders()
+  {
+   if(g_smcDirecao != 1 && g_smcDirecao != -1)
+      return(false);
+
+   double pip = SMC_PipSize();
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(ask <= 0.0 || bid <= 0.0)
+      return(false);
+
+   long   stopsLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist    = (double)stopsLevel * _Point;
+
+   if(g_smcDirecao == 1)
+     {
+      g_smcLimitPrice = NormalizeDouble(g_smcFvgTop, _Digits); // topo do box verde
+
+      if(InpSMC_SLType == SMC_SL_VELA_FVG)
+         g_smcStopLoss = NormalizeDouble(g_smcOriginLow - InpSMC_SLBufferPips * pip, _Digits);
+      else
+         g_smcStopLoss = NormalizeDouble(g_smcLimitPrice - InpSMC_ConservativeSLPips * pip, _Digits);
+
+      double risco = g_smcLimitPrice - g_smcStopLoss;
+      if(risco <= 0.0)
+         return(false);
+
+      g_smcTakeProfit = NormalizeDouble(g_smcLimitPrice + risco * InpSMC_RiskReward, _Digits);
+
+      //--- Buy Limit precisa estar abaixo do Ask e respeitar a distância mínima
+      if(g_smcLimitPrice >= ask || risco < minDist ||
+         (g_smcTakeProfit - g_smcLimitPrice) < minDist)
+         return(false);
+     }
+   else
+     {
+      g_smcLimitPrice = NormalizeDouble(g_smcFvgBottom, _Digits); // fundo do box vermelho
+
+      if(InpSMC_SLType == SMC_SL_VELA_FVG)
+         g_smcStopLoss = NormalizeDouble(g_smcOriginHigh + InpSMC_SLBufferPips * pip, _Digits);
+      else
+         g_smcStopLoss = NormalizeDouble(g_smcLimitPrice + InpSMC_ConservativeSLPips * pip, _Digits);
+
+      double risco = g_smcStopLoss - g_smcLimitPrice;
+      if(risco <= 0.0)
+         return(false);
+
+      g_smcTakeProfit = NormalizeDouble(g_smcLimitPrice - risco * InpSMC_RiskReward, _Digits);
+
+      //--- Sell Limit precisa estar acima do Bid e respeitar a distância mínima
+      if(g_smcLimitPrice <= bid || risco < minDist ||
+         (g_smcLimitPrice - g_smcTakeProfit) < minDist)
+         return(false);
+     }
+
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Envia a ordem LIMITE (Buy Limit / Sell Limit) no FVG mapeado.     |
+//+------------------------------------------------------------------+
+bool SMC_PlacePending()
+  {
+   if(!SMC_ComputeOrders())
+     {
+      Print("[SMC] Ordem limite NÃO enviada: preço já invadiu a zona do FVG ",
+            "ou parâmetros de SL/TP inválidos.");
+      return(false);
+     }
+
+//--- FILTROS GLOBAIS: bloqueiam a armação do setup SMC como qualquer estratégia
+   if(!CheckGlobalFilters(g_smcDirecao == 1 ? SIGNAL_BUY : SIGNAL_SELL))
+     {
+      Print("[SMC] Ordem limite NÃO armada: bloqueada pelos filtros globais.");
+      return(false);
+     }
+
+   double lote = GL_NormalizarLote(InpLoteInicial);
+   if(lote <= 0.0)
+     {
+      Print("[SMC] ERRO: lote inválido para o símbolo ", _Symbol, ".");
+      return(false);
+     }
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+
+   bool ok = false;
+   if(g_smcDirecao == 1)
+      ok = trade.BuyLimit(lote, g_smcLimitPrice, _Symbol, g_smcStopLoss, g_smcTakeProfit,
+                          ORDER_TIME_GTC, 0, "AlphaBot SMC BuyLimit FVG");
+   else
+      ok = trade.SellLimit(lote, g_smcLimitPrice, _Symbol, g_smcStopLoss, g_smcTakeProfit,
+                           ORDER_TIME_GTC, 0, "AlphaBot SMC SellLimit FVG");
+
+   if(!ok)
+     {
+      Print("[SMC] ERRO ao enviar ordem limite. Retcode=", trade.ResultRetcode(),
+            " (", trade.ResultRetcodeDescription(), ").");
+      return(false);
+     }
+
+   g_smcPendingTicket = trade.ResultOrder();
+   g_smcPendingBars   = 0;
+   g_smcEstado        = SMC_STATE_AGUARDANDO_RETESTE;
+
+   Print("[SMC] Ordem limite ", (g_smcDirecao == 1 ? "BUY LIMIT" : "SELL LIMIT"),
+         " armada @ ", DoubleToString(g_smcLimitPrice, _Digits),
+         " | SL=", DoubleToString(g_smcStopLoss, _Digits),
+         " | TP=", DoubleToString(g_smcTakeProfit, _Digits),
+         " | lote=", DoubleToString(lote, 2),
+         " | ticket=", g_smcPendingTicket, ".");
+
+   SMC_DrawSetup();
+   SMC_DrawEntryLabel(g_smcDirecao, g_smcChochTime, g_smcLimitPrice);
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| MÁQUINA DE ESTADOS DO MOTOR SMC (chamada a cada tick no OnTick).  |
+//| Bloqueia entradas conflitantes: só opera o reteste do FVG armado. |
+//+------------------------------------------------------------------+
+void SMC_Manage()
+  {
+   if(InpSMC_SwingBars < 1)
+      return;
+
+   bool temPosicao  = SMC_ExistePosicao();
+   bool temPendente = SMC_OrdemPendenteViva();
+
+//--- ESTADO EM_TRADE: posição aberta; SL/TP nativos conduzem o desfecho
+   if(g_smcEstado == SMC_STATE_EM_TRADE)
+     {
+      if(temPosicao)
+         return;
+
+      SMC_ResetCiclo("Posição encerrada (TP/SL)");
+      Print("[SMC] Ciclo encerrado. Voltando a mapear estrutura (IDLE).");
+      return;
+     }
+
+//--- ESTADO AGUARDANDO_RETESTE: ordem limite viva aguardando o preço
+   if(g_smcEstado == SMC_STATE_AGUARDANDO_RETESTE)
+     {
+      //--- Ordem executada: deixou de ser pendente e virou posição
+      if(!temPendente && temPosicao)
+        {
+         g_smcEstado = SMC_STATE_EM_TRADE;
+         Print("[SMC] Reteste executado! Ordem limite preenchida | posição=",
+               g_smcPositionTicket, " | SL=", DoubleToString(g_smcStopLoss, _Digits),
+               " | TP=", DoubleToString(g_smcTakeProfit, _Digits), ".");
+         return;
+        }
+
+      //--- Ordem sumiu sem gerar posição (cancelada externamente)
+      if(!temPendente && !temPosicao)
+        {
+         SMC_ResetCiclo("Ordem pendente removida externamente");
+         return;
+        }
+
+      //--- Avaliação 1x por candle fechado: expiração / invalidação / mitigação
+      datetime barraFechada = iTime(_Symbol, InpTimeFrame, 1);
+      if(barraFechada != 0 && barraFechada != g_smcUltimaBarraAvaliada)
+        {
+         g_smcUltimaBarraAvaliada = barraFechada;
+         g_smcPendingBars++;
+
+         if(InpSMC_MaxBarsPending > 0 && g_smcPendingBars > InpSMC_MaxBarsPending)
+           {
+            SMC_ResetCiclo("Ordem pendente expirada (" +
+                           IntegerToString(g_smcPendingBars) + " velas)");
+            Print("[SMC] Ordem pendente expirada. Voltando a mapear estrutura (IDLE).");
+            return;
+           }
+
+         MqlRates r[];
+         ArraySetAsSeries(r, true);
+         if(CopyRates(_Symbol, InpTimeFrame, 0, 2, r) == 2)
+           {
+            bool invalidou = ((g_smcDirecao == 1  && r[1].close < g_smcStopLoss) ||
+                              (g_smcDirecao == -1 && r[1].close > g_smcStopLoss));
+            bool mitigou   = ((g_smcDirecao == 1  && r[1].low  <= g_smcFvgBottom) ||
+                              (g_smcDirecao == -1 && r[1].high >= g_smcFvgTop));
+
+            if(invalidou || mitigou)
+              {
+               Print("[SMC] Setup invalidado (",
+                     (invalidou ? "fechamento além do SL estrutural" : "FVG totalmente mitigado"),
+                     "). Ordem limite cancelada.");
+               SMC_ResetCiclo("Setup invalidado");
+               return;
+              }
+           }
+
+         //--- Mantém o box do FVG estendido até a vela atual
+         SMC_DrawSetup();
+        }
+
+      return;
+     }
+
+//--- ESTADO IDLE: mapeia estrutura e arma uma nova ordem limite
+   if(temPosicao || temPendente)
+      return;
+
+   datetime barraFechada = iTime(_Symbol, InpTimeFrame, 1);
+   if(barraFechada == 0 || barraFechada == g_smcUltimaBarraAvaliada)
+      return;
+
+   g_smcUltimaBarraAvaliada = barraFechada;
+
+   if(SMC_ArmarSetup())
+     {
+      if(!SMC_PlacePending())
+         SMC_ResetCiclo("Falha ao armar ordem limite");
+     }
+  }
+
 //+------------------------------------------------------------------+
 //| FUNÇÃO CENTRALIZADORA DE SINAIS DE ENTRADA                        |
 //| Encaminha para o motor escolhido no painel de inputs:             |
 //|   SIGNAL_CANDLE_PATTERNS -> Padrões de Candle (Engolfo/Martelo)   |
 //|   SIGNAL_FIMATHE         -> Metodologia Fimathe (CR + ZN)         |
 //|   SIGNAL_TRAP            -> Armadilha de Liquidez / Wyckoff       |
+//|   SIGNAL_SMC             -> SMC (tratado à parte no OnTick)       |
 //+------------------------------------------------------------------+
 ENUM_ALPHA_SIGNAL CheckEntrySignal()
   {
-   if(InpEntrySignalType == SIGNAL_FIMATHE)
+   if(InpSignalType == SIGNAL_FIMATHE)
       return(CheckFimatheSignal());
 
-   if(InpEntrySignalType == SIGNAL_TRAP)
+   if(InpSignalType == SIGNAL_TRAP)
       return(CheckTrapSignal());
 
    return(CheckPriceActionSignal());
@@ -1257,7 +2014,7 @@ void ManageFimatheSubcycle()
 //+------------------------------------------------------------------+
 void ManageFimatheReversal()
   {
-   if(InpEntrySignalType != SIGNAL_FIMATHE)
+   if(InpSignalType != SIGNAL_FIMATHE)
       return;
 
 //--- O Grid Bidirecional gerencia as pernas por conta própria
@@ -1282,7 +2039,7 @@ void ManageFimatheReversal()
 
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
-   if(CopyRates(_Symbol, PERIOD_CURRENT, 0, 2, rates) != 2)
+   if(CopyRates(_Symbol, InpTimeFrame, 0, 2, rates) != 2)
       return;
 
    double fechamento = rates[1].close;
@@ -1632,38 +2389,52 @@ void ResetGL(CGLGrid &st, const string motivo = "")
   }
 
 //+------------------------------------------------------------------+
-//| Calcula os níveis da grade a partir do preço de entrada.          |
-//| Deve ser chamada imediatamente após abrir a operação principal.   |
+//| Calcula os níveis da grade a partir do preço de entrada e do      |
+//| SL/TP REAIS da ordem inicial (quando informados).                 |
+//|                                                                   |
+//| Lógica estritamente matemática (adapta-se ao trade cirúrgico):     |
+//|   gap SL = |Preço Abertura - Stop Loss| / Níveis SL                |
+//|   gap TP = |Take Profit - Preço Abertura| / Níveis TP              |
+//|                                                                   |
+//| Se slPreco/tpPreco não forem passados (<= 0), usa os pontos        |
+//| globais como fallback (estratégias sem SL/TP dinâmico próprio).    |
 //+------------------------------------------------------------------+
-void CalculateGLLevels(CGLGrid &st, const double precoEntrada, const int direcao)
+void CalculateGLLevels(CGLGrid &st, const double precoEntrada, const int direcao,
+                       const double slPreco = 0.0, const double tpPreco = 0.0)
   {
-   if(!InpEnableGL)
-      return;
-
    ResetGL(st);
 
    st.ativo   = true;
    st.direcao = direcao;
    st.entrada = precoEntrada;
 
-//--- Distâncias globais e passo de cada nível
-   double distanciaSL = InpStopLossGlobal * _Point;
-   double distanciaTP = InpTakeProfitGlobal * _Point;
+//--- Stop Loss efetivo: prioriza o SL real da ordem; senão, pontos globais
+   double slFinal = slPreco;
+   if(slFinal <= 0.0)
+      slFinal = (direcao == 1) ? precoEntrada - InpStopLossGlobal * _Point
+                               : precoEntrada + InpStopLossGlobal * _Point;
+
+//--- Take Profit efetivo: prioriza o TP real da ordem; senão, pontos globais
+   double tpFinal = tpPreco;
+   if(tpFinal <= 0.0)
+      tpFinal = (direcao == 1) ? precoEntrada + InpTakeProfitGlobal * _Point
+                               : precoEntrada - InpTakeProfitGlobal * _Point;
+
+//--- Distâncias totais e passo de cada nível (divisão por níveis)
+   double distanciaSL = MathAbs(precoEntrada - slFinal);
+   double distanciaTP = MathAbs(tpFinal - precoEntrada);
+
+   if(distanciaSL <= 0.0)
+      distanciaSL = InpStopLossGlobal * _Point;
+   if(distanciaTP <= 0.0)
+      distanciaTP = InpTakeProfitGlobal * _Point;
 
    st.stepSL = distanciaSL / MathMax(1, InpLevelsSL);
    st.stepTP = distanciaTP / MathMax(1, InpLevelsTP);
 
-//--- Preços dos extremos (SL e TP globais) espelhados por direção
-   if(direcao == 1)
-     {
-      st.globalSL = precoEntrada - distanciaSL;
-      st.globalTP = precoEntrada + distanciaTP;
-     }
-   else
-     {
-      st.globalSL = precoEntrada + distanciaSL;
-      st.globalTP = precoEntrada - distanciaTP;
-     }
+//--- Extremos da grade coincidem com o SL/TP reais da ordem inicial
+   st.globalSL = slFinal;
+   st.globalTP = tpFinal;
 
 //--- A métrica inicial é zero (preço posicionado na entrada/nível 0)
    st.ultimaMetrica = 0.0;
@@ -1709,6 +2480,61 @@ void CalculateGLLevels(CGLGrid &st, const double precoEntrada, const int direcao
          ") | Nível +1 (TP)=", DoubleToString(GL_PrecoDoNivel(st, 1), _Digits),
          " | Nível -1 (drawdown)=", DoubleToString(GL_PrecoDoNivel(st, -1), _Digits),
          " | Referência=", DoubleToString(precoEntrada, _Digits), ".");
+  }
+
+//+==================================================================+
+//| MÓDULO DE GESTÃO: AUTO-ATACHAMENTO DO GRADIENTE LINEAR            |
+//| Intercepta QUALQUER posição principal aberta (Magic InpMagicNumber)|
+//| por QUALQUER estratégia (SMC, Fimathe, Armadilha, Price Action) e  |
+//| assume o controle, pendurando a grade sobre o SL/TP reais da ordem.|
+//+==================================================================+
+bool GL_AutoAttachUnidirectional()
+  {
+   if(!InpEnableGL || InpBidirectionalGrid)
+      return(false);
+
+//--- A grade já está ativa: nada a fazer
+   if(g_glGrid.ativo)
+      return(false);
+
+//--- Localiza a posição principal (âncora) deste robô no símbolo
+   ulong  ticketAncora = 0;
+   int    direcao      = 0;
+   double precoEntrada = 0.0;
+   double slOrdem      = 0.0;
+   double tpOrdem      = 0.0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
+
+      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      direcao      = (tipo == POSITION_TYPE_BUY) ? 1 : -1;
+      precoEntrada = PositionGetDouble(POSITION_PRICE_OPEN);
+      slOrdem      = PositionGetDouble(POSITION_SL);
+      tpOrdem      = PositionGetDouble(POSITION_TP);
+      ticketAncora = ticket;
+      break;
+     }
+
+   if(ticketAncora == 0 || direcao == 0 || precoEntrada <= 0.0)
+      return(false);
+
+   Print("[GESTÃO GL] Posição principal detectada (magic=", InpMagicNumber,
+         " | ticket=", ticketAncora, " | SL=", DoubleToString(slOrdem, _Digits),
+         " | TP=", DoubleToString(tpOrdem, _Digits), "). Auto-atachando o Gradiente...");
+
+//--- A grade se adapta ao SL/TP reais da ordem (SMC usa SL/TP dinâmicos do FVG)
+   CalculateGLLevels(g_glGrid, precoEntrada, direcao, slOrdem, tpOrdem);
+   return(g_glGrid.ativo);
   }
 
 //+------------------------------------------------------------------+
@@ -2126,6 +2952,7 @@ void CloseAllRobotPositions(const string motivo = "")
    ResetGL(g_glSell, "");
    ResetFimatheState();
    ClearFimatheChannels();
+   SMC_ResetCiclo("Encerramento global da cesta");
   }
 
 //+------------------------------------------------------------------+
@@ -2195,8 +3022,8 @@ bool GL_ReSeedLeg(CGLGrid &st, const int direcao)
          " | TP=", DoubleToString(tp, _Digits),
          " | ticket=", trade.ResultOrder(), ".");
 
-//--- Reativa a grade da perna a partir do novo preço base
-   CalculateGLLevels(st, preco, direcao);
+//--- Reativa a grade da perna a partir do novo preço base (SL/TP reais da nova âncora)
+   CalculateGLLevels(st, preco, direcao, sl, tp);
    return(true);
   }
 
@@ -2429,8 +3256,8 @@ void ExecuteBuy()
          g_trapAtivo = false;
          return;
         }
-      tp = NormalizeDouble(precoEntrada + risco * InpTrapRiskReward, _Digits);
-     }
+       tp = NormalizeDouble(precoEntrada + risco * InpTrapRiskReward, _Digits);
+      }
    else
      {
       sl = NormalizeDouble(precoEntrada - (InpStopLossGlobal * _Point), _Digits);
@@ -2446,7 +3273,7 @@ void ExecuteBuy()
             " | TP: ", DoubleToString(tp, _Digits));
       Print("AlphaBot - Ticket: ", trade.ResultOrder(), ".");
 
-      if(InpEntrySignalType == SIGNAL_FIMATHE)
+      if(InpSignalType == SIGNAL_FIMATHE)
         {
          g_entradaFimathe      = true;
          g_fimatheBEFeito      = false;
@@ -2455,16 +3282,16 @@ void ExecuteBuy()
          Print("[FIMATHE] Entrada de COMPRA registrada. Subciclo de 1 Canal ",
                (InpUseSubcycleProtect ? "ATIVO" : "INATIVO"),
                " | âncora=", g_fimatheAnchorTicket, ".");
-        }
+         }
       else
          ResetFimatheState();
 
-      if(InpEnableGL)
-         CalculateGLLevels(g_glGrid, trade.ResultPrice(), 1);
+      //--- O Gradiente Linear é ativado pelo módulo de gestão (auto-atachamento)
+      //--- na próxima passagem do OnTick, independentemente da estratégia.
      }
-   else
-     {
-      Print("AlphaBot - ERRO ao enviar ordem de COMPRA. Retcode: ",
+    else
+      {
+       Print("AlphaBot - ERRO ao enviar ordem de COMPRA. Retcode: ",
             trade.ResultRetcode(), " (", trade.ResultRetcodeDescription(),
             ") | Erro: ", GetLastError());
      }
@@ -2495,8 +3322,8 @@ void ExecuteSell()
          g_trapAtivo = false;
          return;
         }
-      tp = NormalizeDouble(precoEntrada - risco * InpTrapRiskReward, _Digits);
-     }
+       tp = NormalizeDouble(precoEntrada - risco * InpTrapRiskReward, _Digits);
+      }
    else
      {
       sl = NormalizeDouble(precoEntrada + (InpStopLossGlobal * _Point), _Digits);
@@ -2512,7 +3339,7 @@ void ExecuteSell()
             " | TP: ", DoubleToString(tp, _Digits));
       Print("AlphaBot - Ticket: ", trade.ResultOrder(), ".");
 
-      if(InpEntrySignalType == SIGNAL_FIMATHE)
+      if(InpSignalType == SIGNAL_FIMATHE)
         {
          g_entradaFimathe      = true;
          g_fimatheBEFeito      = false;
@@ -2521,16 +3348,16 @@ void ExecuteSell()
          Print("[FIMATHE] Entrada de VENDA registrada. Subciclo de 1 Canal ",
                (InpUseSubcycleProtect ? "ATIVO" : "INATIVO"),
                " | âncora=", g_fimatheAnchorTicket, ".");
-        }
+         }
       else
          ResetFimatheState();
 
-      if(InpEnableGL)
-         CalculateGLLevels(g_glGrid, trade.ResultPrice(), -1);
+      //--- O Gradiente Linear é ativado pelo módulo de gestão (auto-atachamento)
+      //--- na próxima passagem do OnTick, independentemente da estratégia.
      }
-   else
-     {
-      Print("AlphaBot - ERRO ao enviar ordem de VENDA. Retcode: ",
+    else
+      {
+       Print("AlphaBot - ERRO ao enviar ordem de VENDA. Retcode: ",
             trade.ResultRetcode(), " (", trade.ResultRetcodeDescription(),
             ") | Erro: ", GetLastError());
      }
@@ -2613,6 +3440,11 @@ void ExecuteBidirectionalEntry()
       return;
      }
 
+//--- Restaura os Magics padrão das pernas (caso uma sessão anterior tenha
+//--- sido interceptada por uma posição de estratégia com outro Magic)
+   g_glBuy.DefinirMagics(InpMagicGLBuy, InpMagicGLBuy);
+   g_glSell.DefinirMagics(InpMagicGLSell, InpMagicGLSell);
+
 //--- Preço base comum às duas pernas do Gradiente Linear (grade virtual)
    double precoBase = NormalizeDouble((ask + bid) / 2.0, _Digits);
 
@@ -2649,86 +3481,203 @@ void ExecuteBidirectionalEntry()
       Print("AlphaBot HEDGE - ATENÇÃO: perna de VENDA NÃO foi aberta. ",
             "Verifique saldo/margem, modo de preenchimento e nível mínimo de stops.");
 
-   if(!InpEnableGL)
-      return;
-
-//--- Ativa o Gradiente Linear espelhado a partir do MESMO preço base
+//--- Ativa o Gradiente Linear espelhado, adaptado ao SL/TP real de cada perna
    if(okCompra)
-      CalculateGLLevels(g_glBuy, precoBase, 1);
+      CalculateGLLevels(g_glBuy, precoBase, 1, slCompra, tpCompra);
 
    if(okVenda)
-      CalculateGLLevels(g_glSell, precoBase, -1);
+      CalculateGLLevels(g_glSell, precoBase, -1, slVenda, tpVenda);
 
 //--- Sessão de Hedge iniciada: a partir daqui as DUAS grelhas são mantidas vivas
    g_hedgeAtivo = true;
    Print("AlphaBot HEDGE - Sessão bidirecional iniciada. As duas grelhas serão mantidas ativas.");
   }
 
-//+------------------------------------------------------------------+
-//| Expert tick function                                             |
-//+------------------------------------------------------------------+
-void OnTick()
+//+==================================================================+
+//| MÓDULO DE GESTÃO: AUTO-ATACHAMENTO DO GRID BIDIRECIONAL            |
+//| Intercepta uma posição principal já aberta por QUALQUER estratégia |
+//| (SMC, Fimathe, Armadilha, Price Action) e inicia a sessão de hedge:|
+//| abre a perna oposta a mercado e ativa as duas grelhas espelhadas,  |
+//| ambas adaptadas ao SL/TP reais da ordem interceptada.              |
+//+==================================================================+
+bool GL_AutoAttachBidirectional()
   {
-//--- Subciclo de proteção Fimathe (Breakeven no 1º Canal) da posição-âncora
-   ManageFimatheSubcycle();
+   if(!InpBidirectionalGrid || g_hedgeAtivo)
+      return(false);
 
-//--- Reversão Fimathe (Virar a Mão) ao romper a ZN/CR contra a posição
-   ManageFimatheReversal();
+//--- Localiza a posição principal (magic InpMagicNumber) de qualquer estratégia
+   ulong  ticketAncora = 0;
+   int    direcao      = 0;
+   double precoEntrada = 0.0;
+   double slOrdem      = 0.0;
+   double tpOrdem      = 0.0;
 
-//--- Remove as linhas do Fimathe quando o ciclo é encerrado (TP/SL/cesta)
-   CheckFimatheGraphicsCleanup();
-
-//--- GRID BIDIRECIONAL: proteção da cesta + gestão PARALELA das duas grelhas
-   if(InpBidirectionalGrid)
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
-      //--- Proteção financeira global (cesta). Se disparar, encerra a sessão de hedge
-      if(ExistePosicaoRobo() && CheckGlobalHedgeExit())
-        {
-         g_hedgeAtivo = false;
-         return;
-        }
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
 
-      //--- Sessão já iniciada: mantém SEMPRE as duas pernas vivas e processa ambas
-      if(g_hedgeAtivo)
-        {
-         //--- Re-semeia qualquer perna que tenha sido encerrada/esgotada
-         if(!g_glBuy.ativo)
-            GL_ReSeedLeg(g_glBuy, 1);
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
 
-         if(!g_glSell.ativo)
-            GL_ReSeedLeg(g_glSell, -1);
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
 
-         //--- Gestão independente e incondicional das DUAS grelhas (sem return entre elas)
-         ManageGradient(g_glBuy);
-         ManageGradient(g_glSell);
-         return;
-        }
+      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      direcao      = (tipo == POSITION_TYPE_BUY) ? 1 : -1;
+      precoEntrada = PositionGetDouble(POSITION_PRICE_OPEN);
+      slOrdem      = PositionGetDouble(POSITION_SL);
+      tpOrdem      = PositionGetDouble(POSITION_TP);
+      ticketAncora = ticket;
+      break;
+     }
 
-      //--- Ainda não iniciada, mas há posições do robô: não aplica lógica de posição única
-      if(ExistePosicaoRobo())
-         return;
+   if(ticketAncora == 0 || direcao == 0 || precoEntrada <= 0.0)
+      return(false);
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(ask <= 0.0 || bid <= 0.0)
+      return(false);
+
+//--- Distâncias de risco/retorno herdadas da ordem interceptada
+   double distSL = (slOrdem > 0.0) ? MathAbs(precoEntrada - slOrdem)
+                                   : InpStopLossGlobal * _Point;
+   double distTP = (tpOrdem > 0.0) ? MathAbs(tpOrdem - precoEntrada)
+                                   : InpTakeProfitGlobal * _Point;
+
+   Print("[GESTÃO HEDGE] Interceptando posição principal (ticket=", ticketAncora,
+         " | ", (direcao == 1 ? "COMPRA" : "VENDA"), "). Iniciando sessão de hedge...");
+
+//--- Perna oposta entra a mercado, com o Magic próprio da perna
+   long   magicOposto = (direcao == 1) ? InpMagicGLSell : InpMagicGLBuy;
+   double precoOposto = (direcao == 1) ? bid : ask;
+   double slOposto    = (direcao == 1) ? NormalizeDouble(precoOposto + distSL, _Digits)
+                                       : NormalizeDouble(precoOposto - distSL, _Digits);
+   double tpOposto    = (direcao == 1) ? NormalizeDouble(precoOposto - distTP, _Digits)
+                                       : NormalizeDouble(precoOposto + distTP, _Digits);
+
+   bool okOposto = EnviarPernaHedge((direcao == 1 ? ORDER_TYPE_SELL : ORDER_TYPE_BUY),
+                                    magicOposto, slOposto, tpOposto,
+                                    "AlphaBot Hedge Intercept");
+
+//--- A perna interceptada usa o Magic da estratégia como âncora E nas reentradas
+//--- (grade autoconsistente); a perna oposta usa o Magic próprio da perna.
+   if(direcao == 1)
+     {
+      g_glBuy.DefinirMagics(InpMagicNumber, InpMagicNumber);
+      g_glSell.DefinirMagics(InpMagicGLSell, InpMagicGLSell);
+      CalculateGLLevels(g_glBuy, precoEntrada, 1, slOrdem, tpOrdem);
+      if(okOposto)
+         CalculateGLLevels(g_glSell, precoOposto, -1, slOposto, tpOposto);
      }
    else
      {
-      //--- Gradiente Linear unidirecional ativo: gerencia a grade virtual
-      if(g_glGrid.ativo)
-        {
-         ManageGradient(g_glGrid);
-         return;
-        }
+      g_glSell.DefinirMagics(InpMagicNumber, InpMagicNumber);
+      g_glBuy.DefinirMagics(InpMagicGLBuy, InpMagicGLBuy);
+      CalculateGLLevels(g_glSell, precoEntrada, -1, slOrdem, tpOrdem);
+      if(okOposto)
+         CalculateGLLevels(g_glBuy, precoOposto, 1, slOposto, tpOposto);
      }
 
-//--- Motor de sinal de entrada selecionado no painel de inputs
-//--- (Padrões de Candle OU Metodologia Fimathe)
-   ENUM_ALPHA_SIGNAL sinal=CheckEntrySignal();
+   g_hedgeAtivo = true;
+   Print("AlphaBot HEDGE - Sessão iniciada por INTERCEPTAÇÃO. ",
+         "As duas grelhas serão mantidas ativas.");
+   return(true);
+  }
 
-   if(sinal==SIGNAL_NONE)
+//+==================================================================+
+//| MÓDULO DE GESTÃO: GRID BIDIRECIONAL (HEDGE)                       |
+//| Mantém as duas pernas (compra/venda) vivas e aplica a proteção     |
+//| financeira global da cesta. Independente da estratégia de entrada. |
+//+==================================================================+
+void ManageBidirectionalGrid()
+  {
+//--- Proteção financeira global (cesta)
+   if(ExistePosicaoRobo() && CheckGlobalHedgeExit())
+     {
+      g_hedgeAtivo = false;
+      return;
+     }
+
+//--- Sessão de hedge já iniciada: mantém SEMPRE as duas grelhas vivas
+   if(g_hedgeAtivo)
+     {
+      if(!g_glBuy.ativo)
+         GL_ReSeedLeg(g_glBuy, 1);
+
+      if(!g_glSell.ativo)
+         GL_ReSeedLeg(g_glSell, -1);
+
+      ManageGradient(g_glBuy);
+      ManageGradient(g_glSell);
+      return;
+     }
+
+//--- Sessão NÃO iniciada: intercepta uma posição principal já aberta
+//--- por qualquer estratégia e inicia o hedge automaticamente.
+   GL_AutoAttachBidirectional();
+  }
+
+//+==================================================================+
+//| FLUXO 1 - GESTÃO DE POSIÇÕES ABERTAS (Módulos independentes)      |
+//| Os módulos interceptam qualquer posição pelo Magic Number, sem     |
+//| depender da estratégia que abriu a ordem inicial.                  |
+//+==================================================================+
+void ManageOpenPositions()
+  {
+//--- Módulos específicos do motor Fimathe (subciclo de proteção e reversão)
+   ManageFimatheSubcycle();
+   ManageFimatheReversal();
+   CheckFimatheGraphicsCleanup();
+
+//--- Gestão global de grid/hedge
+   if(InpBidirectionalGrid)
+     {
+      ManageBidirectionalGrid();
+      return;
+     }
+
+   if(InpEnableGL)
+     {
+      //--- Auto-atachamento: intercepta a posição principal e pendura a grade
+      GL_AutoAttachUnidirectional();
+
+      if(g_glGrid.ativo)
+         ManageGradient(g_glGrid);
+     }
+  }
+
+//+==================================================================+
+//| FLUXO 2 - VERIFICAÇÃO DE ENTRADAS (Estratégia selecionada)        |
+//| A estratégia gera APENAS o gatilho da ORDEM INICIAL. A gestão      |
+//| subsequente é responsabilidade dos módulos de gestão de posição.   |
+//+==================================================================+
+void CheckEntrySignals()
+  {
+//--- Módulos de gestão já controlando a posição: não abre novas entradas
+   if(g_glGrid.ativo || g_hedgeAtivo)
       return;
 
-   int direcaoAtual=GetOpenPositionDirection();
+//--- Hedge bidirecional sem sessão iniciada, mas com posição aberta: aguarda
+   if(InpBidirectionalGrid && ExistePosicaoRobo())
+      return;
+
+//--- Gatilho da estratégia escolhida
+   ENUM_ALPHA_SIGNAL sinal = CheckEntrySignal();
+
+   if(sinal == SIGNAL_NONE)
+      return;
+
+//--- FILTROS GLOBAIS (aplicáveis a TODAS as estratégias)
+   if(!CheckGlobalFilters(sinal))
+      return;
+
+   int direcaoAtual = GetOpenPositionDirection();
 
 //--- Sem posição aberta: abre na direção do sinal
-   if(direcaoAtual==0)
+   if(direcaoAtual == 0)
      {
       if(InpBidirectionalGrid)
         {
@@ -2736,7 +3685,7 @@ void OnTick()
          return;
         }
 
-      if(sinal==SIGNAL_BUY)
+      if(sinal == SIGNAL_BUY)
          ExecuteBuy();
       else
          ExecuteSell();
@@ -2745,28 +3694,28 @@ void OnTick()
      }
 
 //--- Com posição aberta: verifica se o sinal é oposto à posição
-   bool sinalOposto=((direcaoAtual==1 && sinal==SIGNAL_SELL) ||
-                     (direcaoAtual==-1 && sinal==SIGNAL_BUY));
+   bool sinalOposto = ((direcaoAtual == 1  && sinal == SIGNAL_SELL) ||
+                       (direcaoAtual == -1 && sinal == SIGNAL_BUY));
 
    if(!sinalOposto)
      {
-      Print("AlphaBot - Sinal de ", (sinal==SIGNAL_BUY ? "COMPRA" : "VENDA"),
+      Print("AlphaBot - Sinal de ", (sinal == SIGNAL_BUY ? "COMPRA" : "VENDA"),
             " (", g_signalPadrao, ") já na direção da posição atual. Ignorado.");
       return;
      }
 
 //--- Sinal oposto à posição: aplica a ação configurada
-   Print("AlphaBot - Sinal oposto de ", (sinal==SIGNAL_BUY ? "COMPRA" : "VENDA"),
+   Print("AlphaBot - Sinal oposto de ", (sinal == SIGNAL_BUY ? "COMPRA" : "VENDA"),
          " (", g_signalPadrao, ") com posição aberta. Ação: ",
          EnumToString(InpOppositeAction), ".");
 
-   if(InpOppositeAction==ACTION_DO_NOTHING)
+   if(InpOppositeAction == ACTION_DO_NOTHING)
      {
       Print("AlphaBot - ACTION_DO_NOTHING: operação atual mantida; sinal oposto ignorado.");
       return;
      }
 
-   ulong ticketFechado=0;
+   ulong ticketFechado = 0;
    if(!CloseOpenPosition(ticketFechado))
       return;
 
@@ -2775,7 +3724,7 @@ void OnTick()
    Print("AlphaBot - Posição ", ticketFechado, " encerrada por sinal oposto (",
          g_signalPadrao, ").");
 
-   if(InpOppositeAction==ACTION_CLOSE_ONLY)
+   if(InpOppositeAction == ACTION_CLOSE_ONLY)
      {
       Print("AlphaBot - ACTION_CLOSE_ONLY: posição encerrada. Aguardando novo sinal.");
       return;
@@ -2783,10 +3732,53 @@ void OnTick()
 
 //--- ACTION_CLOSE_AND_REVERSE: abre imediatamente na direção oposta
    Print("AlphaBot - ACTION_CLOSE_AND_REVERSE: revertendo para ",
-         (sinal==SIGNAL_BUY ? "COMPRA" : "VENDA"), ".");
-   if(sinal==SIGNAL_BUY)
+         (sinal == SIGNAL_BUY ? "COMPRA" : "VENDA"), ".");
+   if(sinal == SIGNAL_BUY)
       ExecuteBuy();
    else
       ExecuteSell();
+  }
+
+//+------------------------------------------------------------------+
+//| Gatilho de NOVA VELA no timeframe OPERACIONAL (InpTimeFrame).     |
+//| Compara o tempo da barra 0 do InpTimeFrame (e não do gráfico),     |
+//| permitindo operar a lógica de M15 estando anexado a um gráfico M1. |
+//+------------------------------------------------------------------+
+bool IsNewBarOperacional()
+  {
+   datetime tempoAtual = iTime(_Symbol, InpTimeFrame, 0);
+   if(tempoAtual == 0)
+      return(false);
+
+   if(tempoAtual == g_ultimaBarraOperacional)
+      return(false);
+
+   g_ultimaBarraOperacional = tempoAtual;
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//| Fluxo em 2 fases: gestão de posições -> verificação de entradas. |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+//================ FLUXO 1: GESTÃO DE POSIÇÕES ABERTAS ================
+   ManageOpenPositions();
+
+//================ FLUXO 2: VERIFICAÇÃO DE ENTRADAS ==================
+//--- O motor SMC é autocontido (arma ordens limite e gerencia seu ciclo),
+//--- porém roda DEPOIS da gestão global para permitir a interceptação.
+   if(InpSignalType == SIGNAL_SMC)
+     {
+      SMC_Manage();
+      return;
+     }
+
+//--- Leitura dos sinais apenas na abertura de uma nova vela operacional
+   if(!IsNewBarOperacional())
+      return;
+
+   CheckEntrySignals();
   }
 //+------------------------------------------------------------------+
