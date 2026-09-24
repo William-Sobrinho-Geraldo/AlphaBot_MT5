@@ -110,6 +110,8 @@ input group "=== GESTÃO GLOBAL: Gradiente e Grid ==="
 input bool   InpEnableGL  = true;   // Ativar Gradiente Linear (Grid Dinâmico)?
 input int    InpLevelsSL  = 4;      // Gradiente: Níveis entre Entrada e Stop Loss
 input int    InpLevelsTP  = 4;      // Gradiente: Níveis entre Entrada e Take Profit
+input int    InpGradient_MaxLevels   = 0;   // Gradiente: Máx. de níveis por lado (0 = ilimitado)
+input double InpGradient_MinStepPips = 1.5; // Gradiente: Espaçamento mínimo entre níveis (pips)
 input long   InpMagicGL   = 654321; // Gradiente: Magic exclusivo das reentradas
 input bool   InpEnablePositivePyramid = true; // Piramidagem: Ativar Gradiente Positivo?
 input double InpPositiveLotBase       = 0.02; // Piramidagem: Volume total na abertura
@@ -129,7 +131,7 @@ input double InpSMC_MinFVGPips       = 2.0;  // SMC: Tamanho mínimo do FVG (Pip
 input ENUM_SMC_SL_TYPE InpSMC_SLType = SMC_SL_RISCO_RETORNO; // SMC: Tipo de Stop Loss
 input double InpSMC_RiskReward       = 3.0;  // SMC: Relação Risco x Retorno (TP / SL)
 input double InpSMC_ConservativeSLPips = 15.0; // SMC: SL conservador (Pips) quando tipo = Risco/Retorno
-input double InpSMC_SLBufferPips     = 2.0;  // SMC: Folga (Pips) do SL agressivo além da vela do FVG
+input double InpSMC_SLBufferPips     = 1.5;  // SMC: Folga técnica (Pips) adicionada ao Stop Loss
 input int    InpSMC_MaxBarsPending   = 20;   // SMC: Máx. de velas com a ordem pendente antes de cancelar
 input bool   InpSMC_DrawVisuals      = true; // SMC: Desenhar Linhas de CHoCH, Box do FVG e Textos no gráfico
 
@@ -249,6 +251,8 @@ public:
    double globalTP;       // Preço do Take Profit global da perna
    double stepSL;         // Tamanho (em preço) de cada nível rumo ao SL
    double stepTP;         // Tamanho (em preço) de cada nível rumo ao TP
+   int    niveisSL;       // Nº EFETIVO de níveis rumo ao SL (após travas dinâmicas)
+   int    niveisTP;       // Nº EFETIVO de níveis rumo ao TP (após travas dinâmicas)
    double ultimaMetrica;  // Última "métrica favorável" observada
    bool   nivelAberto[];  // Estado por nível: há posição aberta?
    ulong  nivelTicket[];  // Ticket associado a cada nível da grade
@@ -349,6 +353,20 @@ int OnInit()
       Alert("AlphaBot - ERRO: InpMagicGLBuy e InpMagicGLSell devem ser diferentes ",
             "para não misturar as reentradas da compra com as da venda. Robô NÃO carregado.");
       Print("AlphaBot - OnInit abortado: Magics das pernas idênticos (", InpMagicGLBuy, ").");
+      return(INIT_FAILED);
+     }
+
+//--- Validação das travas dinâmicas do Gradiente Linear
+   if(InpLevelsSL < 1 || InpLevelsTP < 1 ||
+      InpGradient_MaxLevels < 0 || InpGradient_MinStepPips < 0.0)
+     {
+      Alert("AlphaBot - ERRO: parâmetros inválidos do Gradiente Linear. ",
+            "Exige InpLevelsSL >= 1, InpLevelsTP >= 1, InpGradient_MaxLevels >= 0 e ",
+            "InpGradient_MinStepPips >= 0. Robô NÃO carregado.");
+      Print("AlphaBot - OnInit abortado: Gradiente inválido (NíveisSL=", InpLevelsSL,
+            " | NíveisTP=", InpLevelsTP,
+            " | MaxLevels=", InpGradient_MaxLevels,
+            " | MinStepPips=", DoubleToString(InpGradient_MinStepPips, 2), ").");
       return(INIT_FAILED);
      }
 
@@ -528,6 +546,8 @@ int OnInit()
    Print("AlphaBot - Ação em sinal oposto: ", EnumToString(InpOppositeAction), ".");
    Print("AlphaBot - Gradiente Linear: ", (InpEnableGL ? "ATIVO" : "INATIVO"),
          " (níveis SL=", InpLevelsSL, " | níveis TP=", InpLevelsTP,
+         " | MaxLevels=", (InpGradient_MaxLevels > 0 ? IntegerToString(InpGradient_MaxLevels) : "ilimitado"),
+         " | MinStepPips=", DoubleToString(InpGradient_MinStepPips, 2),
          " | lote=", DoubleToString(InpLoteInicial, 2),
          " | MagicGL=", InpMagicGL, ").");
    Print("AlphaBot - Piramidagem (Gradiente Positivo): ",
@@ -1680,9 +1700,12 @@ bool SMC_ComputeOrders()
       g_smcLimitPrice = NormalizeDouble(g_smcFvgTop, _Digits); // topo do box verde
 
       if(InpSMC_SLType == SMC_SL_VELA_FVG)
-         g_smcStopLoss = NormalizeDouble(g_smcOriginLow - InpSMC_SLBufferPips * pip, _Digits);
+         g_smcStopLoss = g_smcOriginLow; // mínima da perna de impulso (ponto estrutural)
       else
-         g_smcStopLoss = NormalizeDouble(g_smcLimitPrice - InpSMC_ConservativeSLPips * pip, _Digits);
+         g_smcStopLoss = g_smcLimitPrice - InpSMC_ConservativeSLPips * pip;
+
+      //--- Folga técnica (pips) além do ponto estrutural: protege contra ruído/spread
+      g_smcStopLoss = NormalizeDouble(g_smcStopLoss - InpSMC_SLBufferPips * pip, _Digits);
 
       double risco = g_smcLimitPrice - g_smcStopLoss;
       if(risco <= 0.0)
@@ -1700,9 +1723,12 @@ bool SMC_ComputeOrders()
       g_smcLimitPrice = NormalizeDouble(g_smcFvgBottom, _Digits); // fundo do box vermelho
 
       if(InpSMC_SLType == SMC_SL_VELA_FVG)
-         g_smcStopLoss = NormalizeDouble(g_smcOriginHigh + InpSMC_SLBufferPips * pip, _Digits);
+         g_smcStopLoss = g_smcOriginHigh; // máxima da perna de impulso (ponto estrutural)
       else
-         g_smcStopLoss = NormalizeDouble(g_smcLimitPrice + InpSMC_ConservativeSLPips * pip, _Digits);
+         g_smcStopLoss = g_smcLimitPrice + InpSMC_ConservativeSLPips * pip;
+
+      //--- Folga técnica (pips) além do ponto estrutural: protege contra ruído/spread
+      g_smcStopLoss = NormalizeDouble(g_smcStopLoss + InpSMC_SLBufferPips * pip, _Digits);
 
       double risco = g_smcStopLoss - g_smcLimitPrice;
       if(risco <= 0.0)
@@ -2165,6 +2191,17 @@ bool CloseOpenPosition(ulong &closedTicket)
 //+==================================================================+
 
 //+------------------------------------------------------------------+
+//| Tamanho de 1 pip conforme os dígitos do símbolo (Gradiente).       |
+//+------------------------------------------------------------------+
+double GL_PipSize()
+  {
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   if(digits == 3 || digits == 5)
+      return(10.0 * _Point);
+   return(_Point);
+  }
+
+//+------------------------------------------------------------------+
 //| Converte um deslocamento de nível (offset) no índice do array.    |
 //| offset 0 = entrada | negativos = rumo ao SL | positivos = rumo TP |
 //+------------------------------------------------------------------+
@@ -2380,6 +2417,8 @@ void ResetGL(CGLGrid &st, const string motivo = "")
    st.globalTP      = 0.0;
    st.stepSL        = 0.0;
    st.stepTP        = 0.0;
+   st.niveisSL      = InpLevelsSL;
+   st.niveisTP      = InpLevelsTP;
    st.ultimaMetrica = 0.0;
 
    ArrayResize(st.nivelAberto, 0);
@@ -2429,8 +2468,37 @@ void CalculateGLLevels(CGLGrid &st, const double precoEntrada, const int direcao
    if(distanciaTP <= 0.0)
       distanciaTP = InpTakeProfitGlobal * _Point;
 
-   st.stepSL = distanciaSL / MathMax(1, InpLevelsSL);
-   st.stepTP = distanciaTP / MathMax(1, InpLevelsTP);
+//--- TRAVA 1: teto de níveis por lado (InpGradient_MaxLevels; 0 = ilimitado)
+   int pedidoSL = MathMax(1, InpLevelsSL);
+   int pedidoTP = MathMax(1, InpLevelsTP);
+
+   if(InpGradient_MaxLevels > 0)
+     {
+      pedidoSL = MathMin(pedidoSL, InpGradient_MaxLevels);
+      pedidoTP = MathMin(pedidoTP, InpGradient_MaxLevels);
+     }
+
+//--- TRAVA 2: espaçamento mínimo entre níveis (InpGradient_MinStepPips)
+//--- Só agenda níveis que caibam com passo >= minStep. Se o SL/TP for mais
+//--- curto que o passo mínimo, nenhum nível é gerado naquele lado.
+   int niveisSL = pedidoSL;
+   int niveisTP = pedidoTP;
+   double minStepPreco = InpGradient_MinStepPips * GL_PipSize();
+
+   if(minStepPreco > 0.0)
+     {
+      niveisSL = (int)MathFloor(distanciaSL / minStepPreco);
+      niveisTP = (int)MathFloor(distanciaTP / minStepPreco);
+     }
+
+   niveisSL = (int)MathMax(0, MathMin(pedidoSL, niveisSL));
+   niveisTP = (int)MathMax(0, MathMin(pedidoTP, niveisTP));
+
+//--- Distribuição PROPORCIONAL dentro da janela disponível
+   st.niveisSL = niveisSL;
+   st.niveisTP = niveisTP;
+   st.stepSL   = (niveisSL > 0) ? distanciaSL / niveisSL : 0.0;
+   st.stepTP   = (niveisTP > 0) ? distanciaTP / niveisTP : 0.0;
 
 //--- Extremos da grade coincidem com o SL/TP reais da ordem inicial
    st.globalSL = slFinal;
@@ -2464,10 +2532,17 @@ void CalculateGLLevels(CGLGrid &st, const double precoEntrada, const int direcao
    Print("=== GRADIENTE LINEAR ATIVADO ===");
    Print("AlphaBot GL - Direção: ", (direcao == 1 ? "COMPRA" : "VENDA"),
          " | Entrada: ", DoubleToString(precoEntrada, _Digits),
-         " | Níveis SL: ", InpLevelsSL, " (passo ",
+         " | Níveis SL: ", st.niveisSL, "/", InpLevelsSL, " (passo ",
          DoubleToString(st.stepSL, _Digits), ")",
-         " | Níveis TP: ", InpLevelsTP, " (passo ",
+         " | Níveis TP: ", st.niveisTP, "/", InpLevelsTP, " (passo ",
          DoubleToString(st.stepTP, _Digits), ")");
+   if(st.niveisSL < InpLevelsSL || st.niveisTP < InpLevelsTP)
+      Print("AlphaBot GL - Níveis reduzidos pelas travas dinâmicas (MaxLevels=",
+            (InpGradient_MaxLevels > 0 ? IntegerToString(InpGradient_MaxLevels) : "ilimitado"),
+            " | MinStepPips=", DoubleToString(InpGradient_MinStepPips, 2),
+            " | Dist.SL=", DoubleToString(distanciaSL / GL_PipSize(), 2),
+            " pips | Dist.TP=", DoubleToString(distanciaTP / GL_PipSize(), 2),
+            " pips).");
    Print("AlphaBot GL - Global SL: ", DoubleToString(st.globalSL, _Digits),
          " | Global TP: ", DoubleToString(st.globalTP, _Digits),
          " | Lote: ", DoubleToString(InpLoteInicial, 2),
@@ -2583,7 +2658,7 @@ bool GL_OpenPosition(CGLGrid &st, const int offset, const bool positivo = false)
 
 //--- Não abre no extremo do TP global (esse nível é de encerramento total)
    int offsetAlvo = offset + 1;
-   if(offsetAlvo > InpLevelsTP)
+   if(offsetAlvo > st.niveisTP)
       return(false);
 
    bool   piramidar = (positivo && InpEnablePositivePyramid);
@@ -2704,7 +2779,8 @@ void CheckGLDrawdownZone(CGLGrid &st, const double prevM, const double curM)
   {
 //--- Do nível mais profundo (sem tocar o SL global) até o penúltimo
 //--- nível rumo ao TP. Inclui o nível 0 (recuo do lucro para a entrada).
-   for(int offset = -(InpLevelsSL - 1); offset <= InpLevelsTP - 1; offset++)
+   int ddIni = -(st.niveisSL > 0 ? st.niveisSL - 1 : 0);
+   for(int offset = ddIni; offset <= st.niveisTP - 1; offset++)
      {
       if(!GL_CruzouAdverso(st, prevM, curM, offset))
          continue;
@@ -2726,7 +2802,7 @@ void CheckGLProfitZone(CGLGrid &st, const double prevM, const double curM)
   {
 //--- Determina o nível mais alto alcançado neste movimento (trata gaps)
    int nivelMax = -1;
-   for(int offset = 1; offset <= InpLevelsTP; offset++)
+   for(int offset = 1; offset <= st.niveisTP; offset++)
       if(GL_CruzouFavoravel(st, prevM, curM, offset))
          nivelMax = offset;
 
@@ -2734,13 +2810,13 @@ void CheckGLProfitZone(CGLGrid &st, const double prevM, const double curM)
       return;
 
 //--- O extremo superior é tratado pelo encerramento global
-   if(nivelMax == InpLevelsTP)
+   if(nivelMax == st.niveisTP)
       return;
 
    if(InpEnablePositivePyramid)
      {
       //--- GRADIENTE POSITIVO: preserva os runners (não os fecha na rolagem)
-      for(int offset = nivelMax - 1; offset >= -InpLevelsSL; offset--)
+      for(int offset = nivelMax - 1; offset >= -st.niveisSL; offset--)
         {
          int idx = GL_IndiceDoNivel(offset);
          if(idx < 0 || idx >= ArraySize(st.nivelAberto) || !st.nivelAberto[idx])
@@ -2759,7 +2835,7 @@ void CheckGLProfitZone(CGLGrid &st, const double prevM, const double curM)
      }
 
 //--- Gradiente Negativo: rolagem original
-   for(int offset = nivelMax - 1; offset >= -InpLevelsSL; offset--)
+   for(int offset = nivelMax - 1; offset >= -st.niveisSL; offset--)
      {
       int idx = GL_IndiceDoNivel(offset);
       if(idx >= 0 && idx < ArraySize(st.nivelAberto) && st.nivelAberto[idx])
@@ -2794,7 +2870,7 @@ void GL_ManagePositivePartials(CGLGrid &st, const double curM)
       int offset     = idx - InpLevelsSL;
       int offsetAlvo = offset + 1;
 
-      if(offsetAlvo > InpLevelsTP)
+      if(offsetAlvo > st.niveisTP)
          continue;
 
 //--- Alvo virtual: 1 nível à frente do preço de entrada da reentrada
@@ -2894,8 +2970,10 @@ void CloseLegPositions(CGLGrid &st, const string motivo = "")
 //+------------------------------------------------------------------+
 bool CheckGLGlobalClose(CGLGrid &st, const double curM)
   {
-   double metricaTP = st.stepTP * InpLevelsTP;
-   double metricaSL = -st.stepSL * InpLevelsSL;
+//--- Extremos globais derivados dos PREÇOS reais de SL/TP (independe do
+//--- número efetivo de níveis após as travas dinâmicas).
+   double metricaTP = GL_MetricaDoPreco(st, st.globalTP);
+   double metricaSL = GL_MetricaDoPreco(st, st.globalSL);
 
    if(curM >= metricaTP)
      {
@@ -3040,8 +3118,8 @@ void GL_LogEstado(CGLGrid &st, const double preco, const double curM,
    st.ultimoLog = agora;
 
 //--- Próximo nível de drawdown (adverso) ainda não cruzado
-   int proxDD = (InpLevelsSL > 0) ? -InpLevelsSL : 0;
-   for(int k = -1; k >= -InpLevelsSL; k--)
+   int proxDD = (st.niveisSL > 0) ? -st.niveisSL : 0;
+   for(int k = -1; k >= -st.niveisSL; k--)
       if(GL_MetricaDoNivel(st, k) < curM)
         {
          proxDD = k;
@@ -3049,8 +3127,8 @@ void GL_LogEstado(CGLGrid &st, const double preco, const double curM,
         }
 
 //--- Próximo nível de lucro (favorável) ainda não cruzado
-   int proxTP = (InpLevelsTP > 0) ? InpLevelsTP : 0;
-   for(int k = 1; k <= InpLevelsTP; k++)
+   int proxTP = (st.niveisTP > 0) ? st.niveisTP : 0;
+   for(int k = 1; k <= st.niveisTP; k++)
       if(GL_MetricaDoNivel(st, k) > curM)
         {
          proxTP = k;
