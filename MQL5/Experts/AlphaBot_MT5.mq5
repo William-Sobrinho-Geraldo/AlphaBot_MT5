@@ -147,6 +147,10 @@ input int    InpLevelsSL  = 4;      // Gradiente: Níveis entre Entrada e Stop L
 input int    InpLevelsTP  = 4;      // Gradiente: Níveis entre Entrada e Take Profit
 input int    InpGradient_MaxLevels   = 0;   // Gradiente: Máx. de níveis por lado (0 = ilimitado)
 input double InpGradient_MinStepPips = 1.5; // Gradiente: Espaçamento mínimo entre níveis (pips)
+input bool   InpGradientMartingale       = false; // Gradiente: Ativar Martingale nas reentradas?
+input double InpGradientMartMultiplier   = 2.0;   // Gradiente: Multiplicador de lote do Martingale
+input bool   InpGradientBreakEvenExit    = false; // Gradiente: Fechar malha em 0x0 (BreakEven global) após reentrada?
+input double InpGradientBreakEvenOffsetP = 2.0;   // Gradiente: Offset (pontos) do BreakEven a favor da posição
 input long   InpMagicGL   = 654321; // Gradiente: Magic exclusivo das reentradas
 sinput string sep_min_gestao1 = ""; // -------------------------------------------------
 input bool   InpEnablePositivePyramid = true; // Piramidagem: Ativar Gradiente Positivo?
@@ -324,6 +328,7 @@ public:
    ulong  nivelTicket[];  // Ticket associado a cada nível da grade
    bool   nivelPositivo[];// Nível aberto como reentrada do Gradiente Positivo (piramidagem)?
    bool   nivelParcial[]; // Fechamento parcial (Virtual TP) já executado neste nível?
+   bool   beArmado;       // BreakEven defensivo armado (TPs nativos desligados) nesta perna?
    datetime ultimoReseed; // Controle anti-spam das tentativas de re-seed
    datetime ultimoLog;    // Controle de throttling dos logs de depuração
 
@@ -454,6 +459,16 @@ int OnInit()
             " | NíveisTP=", InpLevelsTP,
             " | MaxLevels=", InpGradient_MaxLevels,
             " | MinStepPips=", DoubleToString(InpGradient_MinStepPips, 2), ").");
+      return(INIT_FAILED);
+     }
+
+//--- Validação do Martingale Defensivo
+   if(InpGradientMartingale && InpGradientMartMultiplier <= 1.0)
+     {
+      Alert("AlphaBot - ERRO: InpGradientMartMultiplier deve ser > 1.0 quando o ",
+            "Martingale está ativo. Robô NÃO carregado.");
+      Print("AlphaBot - OnInit abortado: multiplicador de martingale inválido (",
+            DoubleToString(InpGradientMartMultiplier, 2), ").");
       return(INIT_FAILED);
      }
 
@@ -677,6 +692,14 @@ int OnInit()
          " | MinStepPips=", DoubleToString(InpGradient_MinStepPips, 2),
          " | lote=", DoubleToString(InpLoteInicial, 2),
          " | MagicGL=", InpMagicGL, ").");
+   Print("AlphaBot - Martingale Defensivo: ",
+         (InpGradientMartingale ? "ON (x" + DoubleToString(InpGradientMartMultiplier, 2) + ")"
+                                : "OFF"),
+         " | BreakEvenExit: ",
+         (InpGradientBreakEvenExit ? "ON (+"
+                                     + DoubleToString(InpGradientBreakEvenOffsetP, 1)
+                                     + " pontos)"
+                                   : "OFF"), ".");
    Print("AlphaBot - Piramidagem (Gradiente Positivo): ",
          (InpEnablePositivePyramid ? "ATIVA" : "INATIVA"),
          " (lote base=", DoubleToString(InpPositiveLotBase, 2),
@@ -2887,6 +2910,7 @@ void ResetGL(CGLGrid &st, const string motivo = "")
    st.niveisSL      = InpLevelsSL;
    st.niveisTP      = InpLevelsTP;
    st.ultimaMetrica = 0.0;
+   st.beArmado      = false;
 
    ArrayResize(st.nivelAberto, 0);
    ArrayResize(st.nivelTicket, 0);
@@ -3105,6 +3129,112 @@ void GL_SincronizarEstado(CGLGrid &st)
   }
 
 //+------------------------------------------------------------------+
+//| Preço Médio Ponderado de uma perna (âncora + reentradas).         |
+//| Devolve o preço médio e, por referência, o volume total, o nº de   |
+//| posições e o nº de posições ADVERSAS (abaixo da entrada na compra |
+//| / acima na venda). Usado pelo BreakEven defensivo.                |
+//+------------------------------------------------------------------+
+double GL_PrecoMedioPonderado(CGLGrid &st, double &volumeTotal,
+                              int &qtdPosicoes, int &qtdAdversas)
+  {
+   double somaPV = 0.0;
+   volumeTotal  = 0.0;
+   qtdPosicoes  = 0;
+   qtdAdversas  = 0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      long magic = (long)PositionGetInteger(POSITION_MAGIC);
+      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+      bool pertence = (magic == st.magicSub) ||
+                      (magic == st.magicAncora &&
+                       ((st.direcao == 1 && tipo == POSITION_TYPE_BUY) ||
+                        (st.direcao == -1 && tipo == POSITION_TYPE_SELL)));
+      if(!pertence)
+         continue;
+
+      double vol = PositionGetDouble(POSITION_VOLUME);
+      double prc = PositionGetDouble(POSITION_PRICE_OPEN);
+
+      somaPV      += prc * vol;
+      volumeTotal += vol;
+      qtdPosicoes++;
+
+      bool adversa = (st.direcao == 1) ? (prc < st.entrada) : (prc > st.entrada);
+      if(adversa)
+         qtdAdversas++;
+     }
+
+   return((volumeTotal > 0.0) ? somaPV / volumeTotal : 0.0);
+  }
+
+//+------------------------------------------------------------------+
+//| Volume da reentrada do gradiente negativo.                        |
+//| Martingale ativo: base * multiplicador^|offset| (pernível, imune   |
+//| a gaps/derrapagens). O lado positivo (piramidagem) NÃO é afetado.  |
+//+------------------------------------------------------------------+
+double GL_VolumeReentrada(CGLGrid &st, const int offset)
+  {
+   if(!InpGradientMartingale || offset >= 0)
+      return(GL_NormalizarLote(InpLoteInicial));
+
+   double lote = InpLoteInicial * MathPow(InpGradientMartMultiplier, MathAbs(offset));
+   return(GL_NormalizarLote(lote));
+  }
+
+//+------------------------------------------------------------------+
+//| Desliga os TPs nativos de TODAS as posições da perna (âncora +    |
+//| reentradas). Indispensável quando o BreakEven é armado: o fecho   |
+//| passa a ser em cesto, gerido virtualmente pelo EA.                |
+//+------------------------------------------------------------------+
+void GL_DesligarTPsDaPerna(CGLGrid &st)
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      long magic = (long)PositionGetInteger(POSITION_MAGIC);
+      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+      bool pertence = (magic == st.magicSub) ||
+                      (magic == st.magicAncora &&
+                       ((st.direcao == 1 && tipo == POSITION_TYPE_BUY) ||
+                        (st.direcao == -1 && tipo == POSITION_TYPE_SELL)));
+      if(!pertence)
+         continue;
+
+      if(PositionGetDouble(POSITION_TP) <= 0.0)
+         continue;
+
+      double sl = PositionGetDouble(POSITION_SL);
+
+      trade.SetExpertMagicNumber(magic);
+      if(!trade.PositionModify(ticket, sl, 0.0))
+         Print("AlphaBot GL - AVISO: falha ao desligar TP do ticket ", ticket,
+               " (retcode=", trade.ResultRetcode(),
+               " | ", trade.ResultRetcodeDescription(), ").");
+      else
+         Print("AlphaBot GL - BreakEven armado: TP nativo removido do ticket ",
+               ticket, ".");
+     }
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+  }
+
+//+------------------------------------------------------------------+
 //| Abre uma sub-operação a mercado no nível informado.               |
 //| Gradiente Negativo (drawdown): lote padrão, TP no nível k+1 e SL  |
 //| global (comportamento original).                                  |
@@ -3129,6 +3259,7 @@ bool GL_OpenPosition(CGLGrid &st, const int offset, const bool positivo = false)
       return(false);
 
    bool   piramidar = (positivo && InpEnablePositivePyramid);
+   bool   beAtivo   = (InpGradientBreakEvenExit && offset < 0);
    double tp   = 0.0;
    double sl   = 0.0;
    double lote = 0.0;
@@ -3142,10 +3273,18 @@ bool GL_OpenPosition(CGLGrid &st, const int offset, const bool positivo = false)
      }
    else
      {
-      //--- GRADIENTE NEGATIVO (drawdown): comportamento original
-      tp   = NormalizeDouble(GL_PrecoDoNivel(st, offsetAlvo), _Digits);
+      //--- GRADIENTE NEGATIVO (drawdown)
+      //--- BreakEven defensivo: ao armar, desliga TPs nativos da perna UMA vez
+      if(beAtivo && !st.beArmado)
+        {
+         GL_DesligarTPsDaPerna(st);
+         st.beArmado = true;
+        }
+
+      //--- Com BE armado a reentrada nasce SEM TP nativo (fecho em cesto)
+      tp   = beAtivo ? 0.0 : NormalizeDouble(GL_PrecoDoNivel(st, offsetAlvo), _Digits);
       sl   = NormalizeDouble(st.globalSL, _Digits);
-      lote = GL_NormalizarLote(InpLoteInicial);
+      lote = GL_VolumeReentrada(st, offset);
      }
 
    if(lote <= 0.0)
@@ -3462,6 +3601,46 @@ bool CheckGLGlobalClose(CGLGrid &st, const double curM)
   }
 
 //+------------------------------------------------------------------+
+//| ENCERRAMENTO DEFENSIVO EM BREAKEVEN (0x0)                         |
+//| Só entra em ação se houve reentrada ADVERSa (a análise falhou).   |
+//| Calcula o preço médio ponderado da perna e, com um pequeno offset |
+//| a favor, fecha o cesto em break-even, abandonando o TP lucrativo. |
+//| Com apenas 1 ordem (sem reentrada) preserva o alvo original.      |
+//+------------------------------------------------------------------+
+bool CheckGLBreakEvenExit(CGLGrid &st, const double curM)
+  {
+   if(!InpGradientBreakEvenExit)
+      return(false);
+
+   double volumeTotal = 0.0;
+   int    qtd         = 0;
+   int    qtdAdversas = 0;
+   double precoMedio  = GL_PrecoMedioPonderado(st, volumeTotal, qtd, qtdAdversas);
+
+//--- Sem reentrada adversa: mantém o TP Global original (lucro da estratégia)
+   if(qtd <= 1 || qtdAdversas <= 0 || precoMedio <= 0.0)
+      return(false);
+
+//--- Offset a favor da posição cobre comissões/spread
+   double off     = InpGradientBreakEvenOffsetP * _Point;
+   double precoBE = (st.direcao == 1) ? precoMedio + off : precoMedio - off;
+   double metricaBE = GL_MetricaDoPreco(st, precoBE);
+
+   if(curM >= metricaBE)
+     {
+      Print("AlphaBot GL - BREAKEVEN GLOBAL atingido | média=",
+            DoubleToString(precoMedio, _Digits), " | alvo=",
+            DoubleToString(precoBE, _Digits), " | ordens=", qtd,
+            " | adversas=", qtdAdversas, " | vol=",
+            DoubleToString(volumeTotal, 2), ". Encerrando perna.");
+      CloseLegPositions(st, "BreakEven Global");
+      return(true);
+     }
+
+   return(false);
+  }
+
+//+------------------------------------------------------------------+
 //| Fecha TODAS as posições deste robô (todas as pernas) e zera as    |
 //| grades virtuais. Usada pela proteção financeira global da cesta.  |
 //+------------------------------------------------------------------+
@@ -3634,6 +3813,16 @@ void ManageGradient(CGLGrid &st)
 
 //--- Libera níveis fechados pelo broker (TP/SL individuais)
    GL_SincronizarEstado(st);
+
+//--- BreakEven defensivo tem prioridade sobre o TP lucrativo original
+   if(CheckGLBreakEvenExit(st, curM))
+     {
+      //--- Hedge contínuo: re-semeia a perna que completou, mantendo as duas grelhas vivas
+      if(InpBidirectionalGrid)
+         GL_ReSeedLeg(st, dir);
+
+      return;
+     }
 
 //--- Encerramento global prioritário
    if(CheckGLGlobalClose(st, curM))
