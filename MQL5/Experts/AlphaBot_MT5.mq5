@@ -3,7 +3,8 @@
 //|                                                AlphaBot Trading  |
 //|                                                                  |
 //| Foco: Padrões de reversão (Martelo, Martelo Invertido e Engolfo). |
-//| Filtro de tendência macro por Média Móvel (EMA/SMA).             |
+//| Estratégia de Suporte e Resistência (S/R) no timeframe do gráfico.|
+//| Filtro de tendência por Média Móvel (EMA/SMA).                   |
 //| Variante: Grid Bidirecional com Hedge (Compra + Venda no mesmo   |
 //| preço base, cada perna com Gradiente Linear independente).       |
 //+------------------------------------------------------------------+
@@ -14,10 +15,11 @@
 #include <Trade\Trade.mqh>
 
 //+------------------------------------------------------------------+
-//| Prefixos dos objetos gráficos dos Motores Fimathe e SMC          |
+//| Prefixos dos objetos gráficos dos Motores Fimathe, SMC e S/R     |
 //+------------------------------------------------------------------+
 #define FIMATHE_PREFIX "Fimathe_Obj_"
 #define SMC_PREFIX     "SMC_Obj_"
+#define SR_PREFIX      "AlphaBot_SR_"
 
 //+------------------------------------------------------------------+
 //| Ação a tomar quando surge um sinal oposto à posição aberta       |
@@ -36,7 +38,7 @@ enum ENUM_INPUT_SIGNAL_TYPE
   {
    SIGNAL_CANDLE_PATTERNS, // Padrões de Candle (Engolfo, Martelo)
    SIGNAL_FIMATHE,         // Metodologia Fimathe (Rompimento CR + ZN)
-   SIGNAL_TRAP,            // Armadilha de Liquidez / Wyckoff (Fake Breakout + Volume)
+   SIGNAL_SR,              // Suporte e Resistência (Teste de Zona puramente mecânico)
    SIGNAL_SMC              // SMC: CHoCH + FVG (Mudança de Caráter e Desequilíbrio)
   };
 
@@ -66,16 +68,6 @@ enum ENUM_SMC_STATE
     SMC_STATE_IDLE = 0,           // Mapeando estrutura (aguardando CHoCH)
     SMC_STATE_AGUARDANDO_RETESTE, // CHoCH + FVG mapeados: ordem limite pendente
     SMC_STATE_EM_TRADE            // Ordem executada: posição aberta
-   };
-
-//+------------------------------------------------------------------+
-//| Máquina de estados do Motor Armadilha de Raio X Preditivo (VSA)   |
-//+------------------------------------------------------------------+
-enum ENUM_TRAP_STATE
-   {
-    TRAP_STATE_IDLE = 0, // Mapeando liquidez (aguardando a armadilha)
-    TRAP_STATE_ARMADA,   // Armadilha validada: ordem STOP pendente armada
-    TRAP_STATE_EM_TRADE  // Ordem STOP ativada: posição aberta
    };
 
 //+==================================================================+
@@ -117,10 +109,10 @@ sinput string sep_major3c = ""; // =============================================
 //| cumprida, NENHUMA entrada é permitida.                            |
 //+==================================================================+
 input group "=== FILTROS GLOBAIS (Aplicáveis a todas as estratégias) ==="
-input bool   InpUseFiltroMediaMovel = true;  // Ativar Filtro de Média Móvel Macro?
-input int    InpMaMacroPeriod        = 200;       // MM: Período da média macro
-input ENUM_MA_METHOD InpMaMacroMethod = MODE_EMA; // MM: Método (EMA ou SMA)
-input ENUM_APPLIED_PRICE InpMaMacroAppliedPrice = PRICE_CLOSE; // MM: Preço aplicado
+input bool   InpUseFiltroMediaMovel = true;  // Ativar Filtro de Média Móvel (Tendência)?
+input int    InpMaPeriod             = 200;       // MM: Período da média móvel
+input ENUM_MA_METHOD InpMaMethod     = MODE_EMA;  // MM: Método (EMA ou SMA)
+input ENUM_APPLIED_PRICE InpMaAppliedPrice = PRICE_CLOSE; // MM: Preço aplicado
 sinput string sep_min_filtro1 = ""; // -------------------------------------------------
 input bool   InpUseFiltroHorario = false; // Ativar Filtro de Horário?
 input int    InpHoraInicio       = 8;     // Horário: Hora de início (hora do servidor)
@@ -151,15 +143,12 @@ input bool   InpGradientMartingale       = false; // Gradiente: Ativar Martingal
 input double InpGradientMartMultiplier   = 2.0;   // Gradiente: Multiplicador de lote do Martingale
 input bool   InpGradientBreakEvenExit    = false; // Gradiente: Fechar malha em 0x0 (BreakEven global) após reentrada?
 input double InpGradientBreakEvenOffsetP = 2.0;   // Gradiente: Offset (pontos) do BreakEven a favor da posição
-input long   InpMagicGL   = 654321; // Gradiente: Magic exclusivo das reentradas
 sinput string sep_min_gestao1 = ""; // -------------------------------------------------
 input bool   InpEnablePositivePyramid = true; // Piramidagem: Ativar Gradiente Positivo?
 input double InpPositiveLotBase       = 0.02; // Piramidagem: Volume total na abertura
 input double InpPartialCloseVolume    = 0.01; // Piramidagem: Volume fechado no alvo (parcial)
 sinput string sep_min_gestao2 = ""; // -------------------------------------------------
 input bool   InpBidirectionalGrid  = false; // Hedge: Ativar Grid Bidirecional?
-input long   InpMagicGLBuy         = 654321; // Hedge: Magic das reentradas de COMPRA
-input long   InpMagicGLSell        = 654322; // Hedge: Magic das reentradas de VENDA
 input double InpMaxDrawdownMoney   = 50.0;   // Hedge: Perda Máxima Global (em $)
 input double InpTargetProfitMoney  = 20.0;   // Hedge: Lucro Alvo Global (em $)
 
@@ -196,22 +185,34 @@ input bool   InpUseSubcycleProtect  = true; // Fimathe: Breakeven no 1º Subcicl
 input bool   InpAllowFimatheReversal = true; // Fimathe: Virar a Mão (Reversão Automática ao romper ZN)
 
 sinput string sep_major7a = ""; // =================================================
-input group "====== PARÂMETROS: ARMADILHA (WYCKOFF) ===========";
+input group "====== PARÂMETROS: SUPORTE E RESISTÊNCIA (S/R) ======";
 sinput string sep_major7c = ""; // =================================================
 //+==================================================================+
-//| 6) PARÂMETROS ESPECÍFICOS: ARMADILHA (WYCKOFF)                    |
+//| 6) PARÂMETROS ESPECÍFICOS: SUPORTE E RESISTÊNCIA (S/R)            |
 //+==================================================================+
-input group "=== PARÂMETROS ESPECÍFICOS: ARMADILHA (WYCKOFF) ==="
-input int    InpTrapLookback        = 20;   // Armadilha: Velas para buscar Topo/Fundo (Suporte/Resistência)
-input double InpTrapVolMultiplier   = 1.5;  // Armadilha: Multiplicador de Volume de Absorção (vs Média)
-input int    InpTrapVolMAPeriod     = 20;   // Armadilha: Período da Média Móvel de Volume
-sinput string sep_min_trap = ""; // -------------------------------------------------
-input double InpTrapMinPenetrationPips = 3.0; // Armadilha: Penetração mínima do pavio além do nível (Pips)
-input double InpTrapMinWickRatio    = 0.5;  // Armadilha: Pavio de rejeição mín. (fração da amplitude da vela)
-input double InpTrapRiskReward      = 2.0;  // Armadilha: Relação Risco x Retorno (TP / SL)
-input double InpTrapStopBufferPips  = 2.0;  // Armadilha: Folga de Stop (Pips) além do Pavio
-input double InpTrapPendingOffsetPips = 1.0;// Armadilha: Distância da ordem STOP além do extremo da vela 1 (Pips)
-input int    InpTrapMaxBarsPendent  = 3;    // Armadilha: Máx. de velas aguardando a ordem STOP ser ativada
+input group "=== PARÂMETROS ESPECÍFICOS: SUPORTE E RESISTÊNCIA (S/R) ==="
+input int    InpSR_SwingBars        = 5;    // S/R: Velas à esq/dir para Topo/Fundo (Fractal)
+input int    InpSR_Lookback         = 50;   // S/R: Velas varridas para mapear Topos/Fundos
+input double InpSR_ZonePips         = 5.0;  // S/R: Distância de aproximação da zona de gatilho (Pips)
+input double InpSR_MinLevelSpacingPips = 5.0; // S/R: Espaçamento mín. entre níveis do mesmo tipo (Pips; 0=off)
+sinput string sep_min_sr1 = ""; // -------------------------------------------------
+input double InpSR_RiskReward       = 2.0;  // S/R: Relação Risco x Retorno (TP / SL)
+input double InpSR_StopBufferPips   = 2.0;  // S/R: Folga de Stop (Pips) além do Topo/Fundo mapeado
+input int    InpSR_MaxBarsWait      = 10;   // S/R: Máx. de velas mantendo o mapeamento sem gatilho
+sinput string sep_min_sr1b = ""; // -------------------------------------------------
+input bool   InpSR_DrawVisuals      = true; // S/R: Desenhar retângulos das zonas no gráfico?
+input int    InpSR_ZoneExtendBars   = 10;   // S/R: Velas à frente para estender o retângulo da zona
+sinput string sep_min_sr2 = ""; // -------------------------------------------------
+input bool   InpSR_UseScore         = false;// S/R: Ativar filtro de Score? (OFF = Fractal + Zona soberanos)
+input bool   InpSR_UseVolume        = true; // S/R Score: Usar componente de Volume?
+input int    InpSR_VolMAPeriod      = 20;   // S/R Score: Período da Média Móvel de Volume
+input double InpSR_VolMultiplier    = 1.5;  // S/R Score: Multiplicador de Volume (vs Média)
+sinput string sep_min_sr3 = ""; // -------------------------------------------------
+input double InpSR_ScoreBase        = 2.0;  // S/R Score: Pontos base por Topo/Fundo (Fractal)
+input double InpSR_ScoreVolume      = 2.0;  // S/R Score: Pontos extras no Volume expressivo
+input double InpSR_ScoreTouch       = 1.0;  // S/R Score: Pontos extras por Toque histórico na região
+input double InpSR_TouchTolerancePips = 3.0;// S/R Score: Tolerância (Pips) para contar toques na região
+input double InpSR_MinScoreRequired = 2.0;  // S/R Score: Pontuação mínima para validar a zona de S/R
 
 sinput string sep_major8a = ""; // =================================================
 input group "===== PARÂMETROS: PRICE ACTION (CANDLES) =========";
@@ -243,7 +244,7 @@ enum ENUM_ALPHA_SIGNAL
 //+------------------------------------------------------------------+
 CTrade trade;
 
-int    g_handle_ma_macro = INVALID_HANDLE; // Handle da Média Móvel Macro
+int    g_handle_ma_tendencia = INVALID_HANDLE; // Handle da Média Móvel (Tendência)
 int    g_handle_atr      = INVALID_HANDLE; // Handle do ATR do Motor Fimathe
 int    g_handle_stoch    = INVALID_HANDLE; // Handle do Estocástico (filtro global)
 
@@ -272,18 +273,23 @@ bool   g_fimatheCanaisDefinidos = false; // Os canais já foram fixados neste ci
 bool   g_fimatheTinhaPosicao    = false; // O ciclo chegou a ter posição ativa? (transição)
 datetime g_fimatheUltimaBarraLog = 0;    // Anti-spam do log de aguardo (1x por candle)
 
-//--- Estado do Motor Armadilha de Raio X Preditivo (VSA)
-ENUM_TRAP_STATE g_trapEstado        = TRAP_STATE_IDLE; // Estado da máquina de estados
-int    g_trapDirecao                = 0;     // +1 = Spring/Bear Trap (compra) | -1 = Upthrust/Bull Trap (venda)
-double g_trapEntryPrice             = 0.0;   // Preço da ordem STOP pendente
-double g_trapStopLoss               = 0.0;   // Stop Loss calculado pelo pavio (armadilha)
-double g_trapTakeProfit             = 0.0;   // Take Profit calculado por R:R
-double g_trapExtremoArmadilha       = 0.0;   // Extremo da vela 1 (invalidação estrutural)
-datetime g_trapUltimaBarraAvaliada  = 0;     // Controle: avalia apenas 1x por candle fechado
-ulong  g_trapPendingTicket          = 0;     // Ticket da ordem STOP pendente
-int    g_trapPendingBars            = 0;     // Velas decorridas desde a armação
-ulong  g_trapPositionTicket         = 0;     // Ticket da posição executada
-bool   g_trapAtivo                  = false; // (legado) mantido p/ compatibilidade
+//--- Estado do Motor Suporte e Resistência (S/R) - mapeamento MULTI-NÍVEL
+struct StSRLevel
+  {
+   double   price;        // Preço do topo/fundo
+   int      shift;        // Posição da vela do fractal (no mapeamento)
+   datetime time;         // Horário do fractal
+   bool     isResistance; // true = Resistência, false = Suporte
+   bool     active;       // Nível ativo para gatilho
+  };
+
+StSRLevel g_srLevels[];                  // Todos os níveis mapeados na janela de varredura
+bool     g_srMapeado             = false; // Níveis mapeados e válidos?
+int      g_srBarrasSemGatilho    = 0;     // Velas aguardando o gatilho da zona
+datetime g_srUltimaBarraAvaliada = 0;     // Anti-spam: avalia apenas 1x por candle fechado
+bool     g_srAtivo               = false; // Sinal S/R pronto para execução
+int      g_srDirecao             = 0;     // +1 = compra no suporte | -1 = venda na resistência
+double   g_srNivel               = 0.0;   // Nível (topo/fundo) do sinal S/R vigente
 
 //--- Estado do Motor SMC (CHoCH + FVG) - máquina de estados
 ENUM_SMC_STATE g_smcEstado           = SMC_STATE_IDLE; // Estado atual da máquina de estados
@@ -305,17 +311,15 @@ ulong    g_smcPositionTicket      = 0;     // Ticket da posição executada no r
 
 //+------------------------------------------------------------------+
 //| Estado de uma "perna" do Gradiente Linear (Grade Virtual).        |
-//| Cada perna possui seu próprio Magic das reentradas e seus arrays  |
-//| de níveis, garantindo que as reentradas de compra não se misturem |
-//| com as reentradas de venda.                                       |
+//| Todas as ordens do robô usam o MESMO InpMagicNumber. A separação   |
+//| entre as pernas é feita pela DIREÇÃO (compra/venda) e o vínculo de |
+//| cada nível é mantido pelos arrays de tickets da própria perna.    |
 //+------------------------------------------------------------------+
 class CGLGrid
   {
 public:
    bool   ativo;          // Gradiente Linear desta perna em operação?
    int    direcao;        // 1=compra, -1=venda
-   long   magicAncora;    // Magic da posição principal (âncora)
-   long   magicSub;       // Magic exclusivo das reentradas (sub-operações)
    double entrada;        // Preço de entrada da operação principal (nível 0)
    double globalSL;       // Preço do Stop Loss global da perna
    double globalTP;       // Preço do Take Profit global da perna
@@ -331,12 +335,6 @@ public:
    bool   beArmado;       // BreakEven defensivo armado (TPs nativos desligados) nesta perna?
    datetime ultimoReseed; // Controle anti-spam das tentativas de re-seed
    datetime ultimoLog;    // Controle de throttling dos logs de depuração
-
-   void DefinirMagics(const long anc, const long sub)
-     {
-      magicAncora = anc;
-      magicSub    = sub;
-     }
   };
 
 CGLGrid g_glGrid;  // Modo unidirecional (InpEnableGL)
@@ -344,22 +342,22 @@ CGLGrid g_glBuy;   // Perna de COMPRA do Grid Bidirecional
 CGLGrid g_glSell;  // Perna de VENDA do Grid Bidirecional
 
 //+------------------------------------------------------------------+
-//| Cria e valida o handle da Média Móvel Macro.                      |
+//| Cria e valida o handle da Média Móvel (Tendência).                |
 //+------------------------------------------------------------------+
-bool InitMediaMacro()
+bool InitMediaMovelTendencia()
   {
-   g_handle_ma_macro=iMA(_Symbol, InpTimeFrame, InpMaMacroPeriod, 0,
-                         InpMaMacroMethod, InpMaMacroAppliedPrice);
-   if(g_handle_ma_macro==INVALID_HANDLE)
+   g_handle_ma_tendencia=iMA(_Symbol, InpTimeFrame, InpMaPeriod, 0,
+                             InpMaMethod, InpMaAppliedPrice);
+   if(g_handle_ma_tendencia==INVALID_HANDLE)
      {
-      Print("AlphaBot - ERRO: falha ao criar handle da Média Macro ",
-            InpMaMacroPeriod, " (erro ", GetLastError(), ").");
+      Print("AlphaBot - ERRO: falha ao criar handle da Média Móvel (Tendência) ",
+            InpMaPeriod, " (erro ", GetLastError(), ").");
       return(false);
      }
 
-   Print("AlphaBot - Média Macro inicializada (período=", InpMaMacroPeriod,
-         " | método=", EnumToString(InpMaMacroMethod),
-         " | preço=", EnumToString(InpMaMacroAppliedPrice), ").");
+   Print("AlphaBot - Média Móvel (Tendência) inicializada (período=", InpMaPeriod,
+         " | método=", EnumToString(InpMaMethod),
+         " | preço=", EnumToString(InpMaAppliedPrice), ").");
    return(true);
   }
 
@@ -439,15 +437,6 @@ int OnInit()
         }
      }
 
-//--- As pernas de compra e venda NÃO podem compartilhar o mesmo Magic de reentrada
-   if(InpBidirectionalGrid && InpMagicGLBuy==InpMagicGLSell)
-     {
-      Alert("AlphaBot - ERRO: InpMagicGLBuy e InpMagicGLSell devem ser diferentes ",
-            "para não misturar as reentradas da compra com as da venda. Robô NÃO carregado.");
-      Print("AlphaBot - OnInit abortado: Magics das pernas idênticos (", InpMagicGLBuy, ").");
-      return(INIT_FAILED);
-     }
-
 //--- Validação das travas dinâmicas do Gradiente Linear
    if(InpLevelsSL < 1 || InpLevelsTP < 1 ||
       InpGradient_MaxLevels < 0 || InpGradient_MinStepPips < 0.0)
@@ -487,10 +476,10 @@ int OnInit()
         }
      }
 
-//--- Criação e validação do handle da Média Móvel Macro
-   if(!InitMediaMacro())
+//--- Criação e validação do handle da Média Móvel (Tendência)
+   if(!InitMediaMovelTendencia())
      {
-      Alert("AlphaBot - ERRO: falha ao inicializar a Média Macro. Robô NÃO carregado.");
+      Alert("AlphaBot - ERRO: falha ao inicializar a Média Móvel (Tendência). Robô NÃO carregado.");
       return(INIT_FAILED);
      }
 
@@ -536,32 +525,111 @@ int OnInit()
         }
      }
 
-//--- Validação dos parâmetros da Armadilha de Liquidez / Wyckoff
-   if(InpSignalType == SIGNAL_TRAP)
+//--- Validação dos parâmetros do Motor Suporte e Resistência (S/R)
+   if(InpSignalType == SIGNAL_SR)
      {
-       if(InpTrapLookback < 2 || InpTrapVolMAPeriod < 2 ||
-          InpTrapVolMultiplier <= 0.0 || InpTrapRiskReward <= 0.0 ||
-          InpTrapStopBufferPips < 0.0 || InpTrapMinPenetrationPips < 0.0 ||
-          InpTrapMinWickRatio <= 0.0 || InpTrapMinWickRatio > 1.0 ||
-          InpTrapPendingOffsetPips < 0.0 || InpTrapMaxBarsPendent < 1)
-         {
-          Alert("AlphaBot - ERRO: parâmetros inválidos da Armadilha de Liquidez. ",
-                "Exige InpTrapLookback >= 2, InpTrapVolMAPeriod >= 2, ",
-                "InpTrapVolMultiplier > 0, InpTrapRiskReward > 0, InpTrapStopBufferPips >= 0, ",
-                "InpTrapMinPenetrationPips >= 0, 0 < InpTrapMinWickRatio <= 1, ",
-                "InpTrapPendingOffsetPips >= 0 e InpTrapMaxBarsPendent >= 1. ",
-                "Robô NÃO carregado.");
-          Print("AlphaBot - OnInit abortado: Armadilha inválida (lookback=",
-                InpTrapLookback, " | volMA=", InpTrapVolMAPeriod,
-                " | volMult=", DoubleToString(InpTrapVolMultiplier, 2),
-                " | RR=", DoubleToString(InpTrapRiskReward, 2),
-                " | buffer=", DoubleToString(InpTrapStopBufferPips, 2),
-                " | minPen=", DoubleToString(InpTrapMinPenetrationPips, 2),
-                " | wickRatio=", DoubleToString(InpTrapMinWickRatio, 2),
-                " | offset=", DoubleToString(InpTrapPendingOffsetPips, 2),
-                " | maxBars=", InpTrapMaxBarsPendent, ").");
-          return(INIT_FAILED);
-         }
+      string errosSR = "";
+
+      //--- 1) Fractal precisa de ao menos 1 vela em cada lado
+      if(InpSR_SwingBars < 1)
+        {
+         errosSR += "\n- ERRO NO INIT: InpSR_SwingBars (" + IntegerToString(InpSR_SwingBars)
+                  + ") deve ser >= 1. Solução: informe ao menos 1 vela à esquerda/direita do "
+                  + "fractal (valor comum: 5).";
+        }
+
+      //--- 2) Lookback tem de abranger a janela de formação do fractal
+      if(InpSR_Lookback <= InpSR_SwingBars)
+        {
+         int sugestaoSwing = (int)MathMax(1.0, MathMin((double)InpSR_SwingBars,
+                                                       MathFloor((double)InpSR_Lookback / 10.0)));
+         int sugestaoLook  = (int)MathMax(50.0, (double)InpSR_SwingBars * 2.0);
+         errosSR += "\n- ERRO NO INIT: InpSR_SwingBars (" + IntegerToString(InpSR_SwingBars)
+                  + ") não pode ser maior ou igual a InpSR_Lookback ("
+                  + IntegerToString(InpSR_Lookback) + "). O Lookback precisa ser no mínimo "
+                  + "SwingBars + 1 para varrer o fractal. Solução: Reduza o valor de "
+                  + "InpSR_SwingBars (ex: para " + IntegerToString(sugestaoSwing)
+                  + ") ou aumente o InpSR_Lookback (ex: para " + IntegerToString(sugestaoLook) + ").";
+        }
+
+      //--- 3) Zona de aproximação
+      if(InpSR_ZonePips < 0.0)
+        {
+         errosSR += "\n- ERRO NO INIT: InpSR_ZonePips (" + DoubleToString(InpSR_ZonePips, 2)
+                  + ") deve ser >= 0. Solução: use a faixa de aproximação em pips (ex: 5.0).";
+        }
+
+      //--- 3b) Espaçamento mínimo entre níveis do mesmo tipo
+      if(InpSR_MinLevelSpacingPips < 0.0)
+        {
+         errosSR += "\n- ERRO NO INIT: InpSR_MinLevelSpacingPips ("
+                  + DoubleToString(InpSR_MinLevelSpacingPips, 2)
+                  + ") deve ser >= 0. Solução: use 0 para desligar o agrupamento ou um valor "
+                  + "em pips (ex: 5.0) para consolidar níveis próximos.";
+        }
+
+      //--- 4) Relação Risco x Retorno
+      if(InpSR_RiskReward <= 0.0)
+        {
+         errosSR += "\n- ERRO NO INIT: InpSR_RiskReward (" + DoubleToString(InpSR_RiskReward, 2)
+                  + ") deve ser > 0. Solução: use a relação TP/SL desejada (ex: 2.0 = risco 1 : retorno 2).";
+        }
+
+      //--- 5) Folga do Stop técnico
+      if(InpSR_StopBufferPips < 0.0)
+        {
+         errosSR += "\n- ERRO NO INIT: InpSR_StopBufferPips (" + DoubleToString(InpSR_StopBufferPips, 2)
+                  + ") deve ser >= 0. Solução: use a folga do stop além do nível, em pips (ex: 2.0).";
+        }
+
+      //--- 6) Validade do mapeamento
+      if(InpSR_MaxBarsWait < 1)
+        {
+         errosSR += "\n- ERRO NO INIT: InpSR_MaxBarsWait (" + IntegerToString(InpSR_MaxBarsWait)
+                  + ") deve ser >= 1. Solução: use quantas velas o mapeamento fica vivo sem gatilho (ex: 10).";
+        }
+
+      //--- 7) Componente de Volume do Score (só quando Score + Volume ativos)
+      if(InpSR_UseScore && InpSR_UseVolume &&
+         (InpSR_VolMAPeriod < 2 || InpSR_VolMultiplier <= 0.0))
+        {
+         errosSR += "\n- ERRO NO INIT: com Score+Volume ativos, InpSR_VolMAPeriod ("
+                  + IntegerToString(InpSR_VolMAPeriod) + ") deve ser >= 2 e InpSR_VolMultiplier ("
+                  + DoubleToString(InpSR_VolMultiplier, 2) + ") > 0. Solução: use ex: VolMA=20 e "
+                  + "VolMult=1.5, ou desative InpSR_UseVolume/InpSR_UseScore.";
+        }
+
+      //--- 8) Pesos e mínimo do Score (só quando Score ativo)
+      if(InpSR_UseScore &&
+         (InpSR_ScoreBase < 0.0 || InpSR_ScoreVolume < 0.0 ||
+          InpSR_ScoreTouch < 0.0 || InpSR_TouchTolerancePips < 0.0 ||
+          InpSR_MinScoreRequired < 0.0))
+        {
+         errosSR += "\n- ERRO NO INIT: com o Score ativo, os pesos (InpSR_ScoreBase="
+                  + DoubleToString(InpSR_ScoreBase, 2) + ", InpSR_ScoreVolume="
+                  + DoubleToString(InpSR_ScoreVolume, 2) + ", InpSR_ScoreTouch="
+                  + DoubleToString(InpSR_ScoreTouch, 2) + ", InpSR_TouchTolerancePips="
+                  + DoubleToString(InpSR_TouchTolerancePips, 2) + ") e InpSR_MinScoreRequired="
+                  + DoubleToString(InpSR_MinScoreRequired, 2) + " devem ser >= 0. "
+                  + "Solução: use valores >= 0 ou desative InpSR_UseScore.";
+        }
+
+      //--- 9) Extensão visual das zonas
+      if(InpSR_DrawVisuals && InpSR_ZoneExtendBars < 1)
+        {
+         errosSR += "\n- ERRO NO INIT: InpSR_DrawVisuals ativo exige InpSR_ZoneExtendBars ("
+                  + IntegerToString(InpSR_ZoneExtendBars) + ") >= 1. Solução: use 10 velas à frente "
+                  + "ou desative InpSR_DrawVisuals.";
+        }
+
+      if(errosSR != "")
+        {
+         Print("AlphaBot - ERRO NO INIT [MOTOR SUPORTE E RESISTÊNCIA (S/R)]: parâmetros inconsistentes.",
+               errosSR,
+               "\nRobô NÃO carregado. Corrija os valores acima no painel de Inputs e recarregue o EA.");
+         Alert("AlphaBot - ERRO NO INIT [S/R]: parâmetros inválidos. Veja o Diário > Experts para o motivo e a solução. Robô NÃO carregado.");
+         return(INIT_FAILED);
+        }
      }
 
 //--- Validação dos parâmetros do Motor SMC (CHoCH + FVG)
@@ -624,14 +692,9 @@ int OnInit()
       Print("AlphaBot - AVISO: não foi possível definir o modo de preenchimento (filling) para ",
             _Symbol, " (erro ", GetLastError(), ").");
 
-//--- Associação dos Magics a cada perna do Gradiente Linear.
-//--- No Grid Bidirecional cada perna usa um Magic PRÓPRIO (âncora + reentradas),
-//--- garantindo isolamento total: as reentradas de compra nunca se confundem
-//--- com as de venda em nenhuma varredura de posições.
-   g_glGrid.DefinirMagics(InpMagicNumber, InpMagicGL);
-   g_glBuy.DefinirMagics(InpMagicGLBuy, InpMagicGLBuy);
-   g_glSell.DefinirMagics(InpMagicGLSell, InpMagicGLSell);
-
+//--- Magic Number ÚNICO: todas as ordens (âncoras, reentradas, gradiente,
+//--- martingale, piramidagem e hedge) usam exclusivamente InpMagicNumber.
+//--- A separação entre pernas é feita pela DIREÇÃO da posição.
    ResetGL(g_glGrid);
    ResetGL(g_glBuy);
    ResetGL(g_glSell);
@@ -643,8 +706,8 @@ int OnInit()
          (InpTimeFrame == PERIOD_CURRENT ? "PERIOD_CURRENT (gráfico: "
                                            + EnumToString((ENUM_TIMEFRAMES)Period()) + ")"
                                          : EnumToString(InpTimeFrame)), ".");
-   Print("AlphaBot - FILTROS GLOBAIS -> Média Móvel: ",
-         (InpUseFiltroMediaMovel ? "ON (" + IntegerToString(InpMaMacroPeriod) + ")" : "OFF"),
+   Print("AlphaBot - FILTROS GLOBAIS -> Média Móvel (Tendência): ",
+          (InpUseFiltroMediaMovel ? "ON (" + IntegerToString(InpMaPeriod) + ")" : "OFF"),
          " | Horário: ",
          (InpUseFiltroHorario ? "ON (" + IntegerToString(InpHoraInicio) + "h-"
                                 + IntegerToString(InpHoraFim) + "h)" : "OFF"),
@@ -666,16 +729,24 @@ int OnInit()
             " | Reversão (Virar a Mão)=",
             (InpAllowFimatheReversal ? "ON" : "OFF"), ".");
      }
-   if(InpSignalType == SIGNAL_TRAP)
-      Print("AlphaBot ARMADILHA (RAIO X) - Lookback=", InpTrapLookback,
-            " | VolMA=", InpTrapVolMAPeriod,
-            " | VolMult=", DoubleToString(InpTrapVolMultiplier, 2),
-            " | R:R=", DoubleToString(InpTrapRiskReward, 2),
-            " | Buffer(pips)=", DoubleToString(InpTrapStopBufferPips, 2),
-            " | Penetração mín(pips)=", DoubleToString(InpTrapMinPenetrationPips, 2),
-            " | Pavio mín(fração)=", DoubleToString(InpTrapMinWickRatio, 2),
-            " | Offset STOP(pips)=", DoubleToString(InpTrapPendingOffsetPips, 2),
-            " | MaxBarsPend=", InpTrapMaxBarsPendent, ".");
+   if(InpSignalType == SIGNAL_SR)
+      Print("AlphaBot SUPORTE E RESISTÊNCIA (S/R) - SwingBars=", InpSR_SwingBars,
+            " | Lookback=", InpSR_Lookback,
+            " | Zona(pips)=", DoubleToString(InpSR_ZonePips, 2),
+            " | EspaçamentoMín(pips)=", DoubleToString(InpSR_MinLevelSpacingPips, 2),
+            " | Score=", (InpSR_UseScore ? "ON" : "OFF"),
+            " | Volume=", (InpSR_UseVolume ? "ON" : "OFF"),
+            " | VolMA=", InpSR_VolMAPeriod,
+            " | VolMult=", DoubleToString(InpSR_VolMultiplier, 2),
+            " | R:R=", DoubleToString(InpSR_RiskReward, 2),
+            " | Buffer(pips)=", DoubleToString(InpSR_StopBufferPips, 2),
+            " | MaxBarsSemGatilho=", InpSR_MaxBarsWait,
+            " | Visuais=", (InpSR_DrawVisuals ? "ON (+"+IntegerToString(InpSR_ZoneExtendBars)+" velas)" : "OFF"),
+            " | ScoreBase=", DoubleToString(InpSR_ScoreBase, 2),
+            " | ScoreVolume=", DoubleToString(InpSR_ScoreVolume, 2),
+            " | ScoreToque=", DoubleToString(InpSR_ScoreTouch, 2),
+            " | TolToque(pips)=", DoubleToString(InpSR_TouchTolerancePips, 2),
+            " | MinScore=", DoubleToString(InpSR_MinScoreRequired, 2), ".");
    if(InpSignalType == SIGNAL_SMC)
       Print("AlphaBot SMC - SwingBars=", InpSMC_SwingBars,
             " | FVG mín(pips)=", DoubleToString(InpSMC_MinFVGPips, 2),
@@ -691,7 +762,7 @@ int OnInit()
          " | MaxLevels=", (InpGradient_MaxLevels > 0 ? IntegerToString(InpGradient_MaxLevels) : "ilimitado"),
          " | MinStepPips=", DoubleToString(InpGradient_MinStepPips, 2),
          " | lote=", DoubleToString(InpLoteInicial, 2),
-         " | MagicGL=", InpMagicGL, ").");
+         " | Magic=", InpMagicNumber, ").");
    Print("AlphaBot - Martingale Defensivo: ",
          (InpGradientMartingale ? "ON (x" + DoubleToString(InpGradientMartMultiplier, 2) + ")"
                                 : "OFF"),
@@ -706,7 +777,7 @@ int OnInit()
          " | parcial=", DoubleToString(InpPartialCloseVolume, 2),
          " | SL nativo 1 nível atrás, sem TP nativo).");
    Print("AlphaBot - Grid Bidirecional: ", (InpBidirectionalGrid ? "ATIVO" : "INATIVO"),
-         " (Magic BUY=", InpMagicGLBuy, " | Magic SELL=", InpMagicGLSell,
+         " (Magic único=", InpMagicNumber,
          " | Alvo=$", DoubleToString(InpTargetProfitMoney, 2),
          " | Perda máx=$", DoubleToString(InpMaxDrawdownMoney, 2), ").");
    Print("AlphaBot - Inicializado com sucesso: conta em modo HEDGE. MagicNumber=",
@@ -719,10 +790,10 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
-   if(g_handle_ma_macro!=INVALID_HANDLE)
+   if(g_handle_ma_tendencia!=INVALID_HANDLE)
      {
-      IndicatorRelease(g_handle_ma_macro);
-      g_handle_ma_macro=INVALID_HANDLE;
+      IndicatorRelease(g_handle_ma_tendencia);
+      g_handle_ma_tendencia=INVALID_HANDLE;
      }
 
    if(g_handle_atr!=INVALID_HANDLE)
@@ -742,6 +813,9 @@ void OnDeinit(const int reason)
 
 //--- Remove os objetos gráficos do Motor SMC
    SMC_ClearVisuals();
+
+//--- Remove os retângulos das zonas do Motor S/R
+   SR_ClearVisuals();
 
    Print("AlphaBot - Desinicializado. Código de motivo: ", reason);
   }
@@ -873,8 +947,8 @@ bool IsBearishEngulfing(const MqlRates &candle1, const MqlRates &candle2)
 
 //+------------------------------------------------------------------+
 //| Avalia APENAS o price action do candle [1] (Martelo / Engolfo).   |
-//| O filtro de tendência macro agora é GLOBAL e aplicado a todas as  |
-//| estratégias por CheckGlobalFilters().                             |
+//| O filtro de tendência é GLOBAL e aplicado a todas as estratégias   |
+//| por CheckGlobalFilters().                                         |
 //+------------------------------------------------------------------+
 ENUM_ALPHA_SIGNAL CheckPriceActionSignal()
   {
@@ -974,7 +1048,7 @@ bool CheckGlobalStochasticFilter(const ENUM_ALPHA_SIGNAL sinal_gerado)
 
 //+==================================================================+
 //| FILTROS GLOBAIS (bloqueiam entradas de QUALQUER estratégia)       |
-//|   - Filtro de Média Móvel Macro (direcional)                      |
+//|   - Filtro de Média Móvel (Tendência) (direcional)                |
 //|   - Filtro de Horário (janela de operação, hora do servidor)      |
 //|   - Filtro de Estocástico (momentum: %K da vela 1)                |
 //| Retorna true se a entrada PODE ser executada.                     |
@@ -1007,24 +1081,24 @@ bool CheckGlobalFilters(const ENUM_ALPHA_SIGNAL sinal)
         }
      }
 
-//--- FILTRO DE MÉDIA MÓVEL MACRO (direcional)
+//--- FILTRO DE MÉDIA MÓVEL (TENDÊNCIA) (direcional)
    if(InpUseFiltroMediaMovel)
      {
-      if(g_handle_ma_macro == INVALID_HANDLE)
+      if(g_handle_ma_tendencia == INVALID_HANDLE)
         {
-         Print("AlphaBot - ENTRADA BLOQUEADA [FILTRO MM]: handle da Média Macro inválido.");
+         Print("AlphaBot - ENTRADA BLOQUEADA [FILTRO MM]: handle da Média Móvel (Tendência) inválido.");
          return(false);
         }
 
-      if(Bars(_Symbol, InpTimeFrame) < InpMaMacroPeriod + 3)
+      if(Bars(_Symbol, InpTimeFrame) < InpMaPeriod + 3)
         {
          Print("AlphaBot - ENTRADA BLOQUEADA [FILTRO MM]: barras insuficientes (",
-               Bars(_Symbol, InpTimeFrame), ") para a Média Macro ", InpMaMacroPeriod, ".");
+               Bars(_Symbol, InpTimeFrame), ") para a Média Móvel ", InpMaPeriod, ".");
          return(false);
         }
 
       double ma[];
-      if(CopyBuffer(g_handle_ma_macro, 0, 0, 1, ma) != 1)
+      if(CopyBuffer(g_handle_ma_tendencia, 0, 0, 1, ma) != 1)
         {
          Print("AlphaBot - ENTRADA BLOQUEADA [FILTRO MM]: CopyBuffer retornou ",
                GetLastError(), ".");
@@ -1037,7 +1111,7 @@ bool CheckGlobalFilters(const ENUM_ALPHA_SIGNAL sinal)
       if(direcao == 1 && preco <= ma[0])
         {
          Print("AlphaBot - ENTRADA BLOQUEADA [FILTRO MM]: COMPRA exige Preço (",
-               DoubleToString(preco, _Digits), ") > Média Macro (",
+               DoubleToString(preco, _Digits), ") > Média Móvel (",
                DoubleToString(ma[0], _Digits), ").");
          return(false);
         }
@@ -1045,7 +1119,7 @@ bool CheckGlobalFilters(const ENUM_ALPHA_SIGNAL sinal)
       if(direcao == -1 && preco >= ma[0])
         {
          Print("AlphaBot - ENTRADA BLOQUEADA [FILTRO MM]: VENDA exige Preço (",
-               DoubleToString(preco, _Digits), ") < Média Macro (",
+               DoubleToString(preco, _Digits), ") < Média Móvel (",
                DoubleToString(ma[0], _Digits), ").");
          return(false);
         }
@@ -1410,28 +1484,39 @@ ENUM_ALPHA_SIGNAL CheckFimatheSignal()
   }
 
 //+==================================================================+
-//|   MOTOR ARMADILHA DE RAIO X PREDITIVO / VSA (FAKE BREAKOUT)       |
+//|   MOTOR SUPORTE E RESISTÊNCIA (S/R) - TESTE DE ZONA + CONFIRMAÇÃO |
 //|                                                                    |
-//| MÁQUINA DE ESTADOS (ordem STOP pendente):                          |
-//|   IDLE    -> mapeia liquidez e aguarda uma armadilha validada       |
-//|   ARMADA  -> armadilha confirmada; ordem STOP além da vela 1        |
-//|   EM_TRADE-> ordem STOP ativada; SL/TP nativos conduzem o desfecho  |
+//| O motor opera DIRETAMENTE no timeframe do gráfico (InpTimeFrame).  |
+//| Não há dependência de timeframes Macro/Micro.                      |
 //|                                                                    |
-//| Confirmação VSA (Esforço x Resultado) no fechamento da vela 1:      |
-//|   COMPRA (Spring / Bear Trap): mínima fura o suporte por uma        |
-//|     penetração mínima, fechamento na METADE SUPERIOR da vela, com   |
-//|     pavio inferior proeminente e volume de absorção acima da média. |
-//|   VENDA  (Upthrust / Bull Trap): máxima fura a resistência, fecha   |
-//|     na METADE INFERIOR da vela, pavio superior proeminente e volume |
-//|     acima da média.                                                 |
-//|   O gatilho é a ORDEM STOP: compra acima da máxima da vela 1 e      |
-//|     venda abaixo da mínima. Expira após InpTrapMaxBarsPendent velas. |
+//| MAPEAMENTO MULTI-NÍVEL: TODOS os topos e fundos históricos são    |
+//| detectados por FRACTAL (InpSR_SwingBars velas menores à esquerda e |
+//| à direita) dentro da janela InpSR_Lookback, e armazenados em       |
+//| g_srLevels[] (struct StSRLevel). Topos = RESISTÊNCIA, fundos =     |
+//| SUPORTE. Níveis do mesmo tipo muito próximos são consolidados pelo |
+//| filtro InpSR_MinLevelSpacingPips, evitando faixas empilhadas.      |
+//|                                                                    |
+//| ZONA DE GATILHO (SOBERANA E 100% MECÂNICA): o preço deve TESTAR a |
+//| faixa de QUALQUER nível ativo dentro de InpSR_ZonePips. O 1º nível |
+//| tocado (mais próximo do preço) é validado e consumido (active=false)|
+//| sem qualquer exigência de Price Action (Martelo/Engolfo).          |
+//|   - InpSR_UseScore (opcional): liga o score de relevância          |
+//|       Score = InpSR_ScoreBase + InpSR_ScoreVolume (volume         |
+//|       expressivo) + InpSR_ScoreTouch x toques históricos.          |
+//| Confirmado, a ordem entra A MERCADO. O Stop Loss respeita a        |
+//| distância InpSR_StopBufferPips além do topo/fundo mapeado e o TP   |
+//| é calculado por Risco x Retorno.                                   |
+//|                                                                    |
+//| VISUALIZAÇÃO: se InpSR_DrawVisuals, CADA nível ativo ganha um       |
+//| retângulo OBJ_RECTANGLE (Resistência = VERMELHO, Suporte = VERDE)  |
+//| cobrindo [nível ± InpSR_ZonePips], com nomes AlphaBot_SR_Res_N /   |
+//| AlphaBot_SR_Sup_N. O gráfico é limpo por prefixo a cada atualização.|
 //+==================================================================+
 
 //+------------------------------------------------------------------+
 //| Tamanho de 1 pip conforme os dígitos do símbolo.                  |
 //+------------------------------------------------------------------+
-double TrapPipSize()
+double SR_PipSize()
   {
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    if(digits == 3 || digits == 5)
@@ -1440,344 +1525,503 @@ double TrapPipSize()
   }
 
 //+------------------------------------------------------------------+
-//| Arma a ordem STOP da armadilha e registra o estado ARMADA.         |
+//| Timeframe efetivo do motor S/R (resolve PERIOD_CURRENT).          |
 //+------------------------------------------------------------------+
-bool Trap_PlaceStopOrder(const int direcao, const double entry,
-                         const double sl, const double tp)
+ENUM_TIMEFRAMES SR_TimeFrame()
   {
-//--- FILTROS GLOBAIS: bloqueiam a armação da armadilha como qualquer estratégia
-   if(!CheckGlobalFilters(direcao == 1 ? SIGNAL_BUY : SIGNAL_SELL))
-     {
-      Print("[ARMADILHA] Ordem STOP NÃO armada: bloqueada pelos filtros globais.");
-      return(false);
-     }
-
-   double lote = GL_NormalizarLote(InpLoteInicial);
-   if(lote <= 0.0)
-     {
-      Print("[ARMADILHA] ERRO: lote inválido para o símbolo ", _Symbol, ".");
-      return(false);
-     }
-
-   trade.SetExpertMagicNumber(InpMagicNumber);
-
-   bool ok = false;
-   if(direcao == 1)
-      ok = trade.BuyStop(lote, entry, _Symbol, sl, tp,
-                         ORDER_TIME_GTC, 0, "AlphaBot Trap BuyStop");
-   else
-      ok = trade.SellStop(lote, entry, _Symbol, sl, tp,
-                          ORDER_TIME_GTC, 0, "AlphaBot Trap SellStop");
-
-   if(!ok)
-     {
-      Print("[ARMADILHA] ERRO ao enviar ordem STOP. Retcode=", trade.ResultRetcode(),
-            " (", trade.ResultRetcodeDescription(), ").");
-      return(false);
-     }
-
-   g_trapEstado           = TRAP_STATE_ARMADA;
-   g_trapDirecao          = direcao;
-   g_trapEntryPrice       = entry;
-   g_trapStopLoss         = sl;
-   g_trapTakeProfit       = tp;
-   g_trapExtremoArmadilha = (direcao == 1 ? iLow(_Symbol, InpTimeFrame, 1)
-                                          : iHigh(_Symbol, InpTimeFrame, 1));
-   g_trapPendingTicket    = trade.ResultOrder();
-   g_trapPendingBars      = 0;
-
-   Print("[ARMADILHA] Ordem ", (direcao == 1 ? "BUY STOP" : "SELL STOP"),
-         " armada @ ", DoubleToString(entry, _Digits),
-         " | SL=", DoubleToString(sl, _Digits),
-         " | TP=", DoubleToString(tp, _Digits),
-         " | lote=", DoubleToString(lote, 2),
-         " | ticket=", g_trapPendingTicket, ".");
-   return(true);
+   return((InpTimeFrame == PERIOD_CURRENT) ? (ENUM_TIMEFRAMES)Period() : InpTimeFrame);
   }
 
 //+------------------------------------------------------------------+
-//| Existe alguma posição aberta deste robô? (magic global)           |
+//| Remove TODOS os objetos gráficos do Motor S/R.                    |
 //+------------------------------------------------------------------+
-bool Trap_ExistePosicao()
+void SR_ClearVisuals()
   {
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-     {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0)
-         continue;
-
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
-         continue;
-
-      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
-         continue;
-
-      g_trapPositionTicket = ticket;
-      return(true);
-     }
-
-   return(false);
+   ObjectsDeleteAll(0, SR_PREFIX);
   }
 
 //+------------------------------------------------------------------+
-//| Existe ordem STOP pendente deste robô?                            |
+//| Desenha/atualiza UM retângulo de zona de S/R.                     |
+//| A faixa vertical vai de (nível - InpSR_ZonePips) a                |
+//| (nível + InpSR_ZonePips). Se nivel <= 0, remove o objeto.         |
 //+------------------------------------------------------------------+
-bool Trap_OrdemPendenteViva()
+void SR_DrawZone(const string nome, const double nivel, const datetime tempoEsq,
+                 const color cor, const string rotulo)
   {
-   if(g_trapPendingTicket != 0 && OrderSelect(g_trapPendingTicket))
-      return(true);
-
-   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   if(nivel <= 0.0)
      {
-      ulong ticket = OrderGetTicket(i);
-      if(ticket == 0)
-         continue;
-
-      if(OrderGetString(ORDER_SYMBOL) != _Symbol)
-         continue;
-
-      if((long)OrderGetInteger(ORDER_MAGIC) != InpMagicNumber)
-         continue;
-
-      g_trapPendingTicket = ticket;
-      return(true);
+      if(ObjectFind(0, nome) >= 0)
+         ObjectDelete(0, nome);
+      return;
      }
 
-   return(false);
+   double pip   = SR_PipSize();
+   double faixa = InpSR_ZonePips * pip;
+   double topo  = NormalizeDouble(nivel + faixa, _Digits);
+   double fundo = NormalizeDouble(nivel - faixa, _Digits);
+
+   ENUM_TIMEFRAMES tf = SR_TimeFrame();
+   datetime tempoDir  = iTime(_Symbol, tf, 0)
+                        + (datetime)(PeriodSeconds(tf) * InpSR_ZoneExtendBars);
+
+   datetime tEsq = tempoEsq;
+   if(tEsq <= 0 || tEsq >= tempoDir)
+      tEsq = iTime(_Symbol, tf, (int)MathMin((double)MathMax(InpSR_Lookback, 1),
+                                             (double)(Bars(_Symbol, tf) - 1)));
+   if(tEsq <= 0 || tEsq >= tempoDir)
+      tEsq = tempoDir - PeriodSeconds(tf);
+
+   if(ObjectFind(0, nome) < 0)
+     {
+      ObjectCreate(0, nome, OBJ_RECTANGLE, 0, tEsq, topo, tempoDir, fundo);
+      ObjectSetInteger(0, nome, OBJPROP_STYLE, STYLE_SOLID);
+      ObjectSetInteger(0, nome, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(0, nome, OBJPROP_FILL, true);
+      ObjectSetInteger(0, nome, OBJPROP_BACK, true);
+      ObjectSetInteger(0, nome, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, nome, OBJPROP_SELECTED, false);
+      ObjectSetInteger(0, nome, OBJPROP_HIDDEN, true);
+     }
+
+   ObjectSetInteger(0, nome, OBJPROP_COLOR, cor);
+   ObjectSetInteger(0, nome, OBJPROP_TIME, 0, tEsq);
+   ObjectSetInteger(0, nome, OBJPROP_TIME, 1, tempoDir);
+   ObjectSetDouble(0, nome, OBJPROP_PRICE, 0, topo);
+   ObjectSetDouble(0, nome, OBJPROP_PRICE, 1, fundo);
+   ObjectSetString(0, nome, OBJPROP_TOOLTIP,
+                   rotulo + " | Nível=" + DoubleToString(nivel, _Digits)
+                   + " | Faixa=±" + DoubleToString(InpSR_ZonePips, 2) + " pips");
   }
 
 //+------------------------------------------------------------------+
-//| Cancela a ordem STOP pendente da armadilha.                       |
+//| Atualiza os retângulos de TODOS os níveis ativos do array.         |
+//| Limpa o gráfico (ObjectsDeleteAll pelo prefixo) e redesenha apenas |
+//| os níveis ativos, nomeando cada objeto por tipo+índice:            |
+//|   Resistências -> AlphaBot_SR_Res_0, Res_1, ... (Vermelho)         |
+//|   Suportes     -> AlphaBot_SR_Sup_0, Sup_1, ... (Verde)            |
 //+------------------------------------------------------------------+
-void Trap_CancelPending(const string motivo)
+void SR_UpdateVisuals()
   {
-   if(g_trapPendingTicket != 0 && OrderSelect(g_trapPendingTicket))
+   if(!InpSR_DrawVisuals)
+      return;
+
+//--- Limpeza completa para nunca acumular objetos antigos
+   SR_ClearVisuals();
+
+   int nRes = 0;
+   int nSup = 0;
+
+   for(int i = 0; i < ArraySize(g_srLevels); i++)
      {
-      if(trade.OrderDelete(g_trapPendingTicket))
-         Print("[ARMADILHA] Ordem STOP cancelada (", motivo,
-               ") | ticket=", g_trapPendingTicket, ".");
+      if(!g_srLevels[i].active)
+         continue;
+
+      if(g_srLevels[i].isResistance)
+        {
+         SR_DrawZone(SR_PREFIX + "Res_" + IntegerToString(nRes),
+                     g_srLevels[i].price, g_srLevels[i].time,
+                     clrRed, "Resistência (Venda)");
+         nRes++;
+        }
       else
-         Print("[ARMADILHA] ERRO ao cancelar ordem ", g_trapPendingTicket, " (", motivo,
-               "). Retcode=", trade.ResultRetcode(),
-               " (", trade.ResultRetcodeDescription(), ").");
+        {
+         SR_DrawZone(SR_PREFIX + "Sup_" + IntegerToString(nSup),
+                     g_srLevels[i].price, g_srLevels[i].time,
+                     clrLime, "Suporte (Compra)");
+         nSup++;
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Verifica se já existe um nível do MESMO tipo dentro do espaçamento |
+//| mínimo (InpSR_MinLevelSpacingPips) — evita empilhar faixas no mesmo |
+//| preço. Compare apenas contra o mesmo tipo (topo x topo).           |
+//+------------------------------------------------------------------+
+bool SR_NivelDuplicado(const double preco, const bool isResistencia, const double spacing)
+  {
+   if(spacing <= 0.0)
+      return(false);
+
+   for(int i = 0; i < ArraySize(g_srLevels); i++)
+     {
+      if(g_srLevels[i].isResistance != isResistencia)
+         continue;
+
+      if(MathAbs(g_srLevels[i].price - preco) <= spacing)
+         return(true);
      }
 
-   g_trapPendingTicket = 0;
+   return(false);
   }
 
 //+------------------------------------------------------------------+
-//| Reinicia o ciclo da armadilha (cancela pendente e zera o estado). |
+//| MAPEIA TODOS os topos/fundos por FRACTAL dentro da janela          |
+//| InpSR_Lookback. Varre do mais recente ao mais antigo e adiciona    |
+//| cada fractal válido ao array global g_srLevels (aplicando o filtro |
+//| de espaçamento mínimo). Retorna a quantidade de níveis mapeados.   |
 //+------------------------------------------------------------------+
-void Trap_ResetCiclo(const string motivo)
+int SR_MapearNiveis()
   {
-   Trap_CancelPending(motivo);
+   ArrayResize(g_srLevels, 0);
 
-   g_trapEstado           = TRAP_STATE_IDLE;
-   g_trapDirecao          = 0;
-   g_trapEntryPrice       = 0.0;
-   g_trapStopLoss         = 0.0;
-   g_trapTakeProfit       = 0.0;
-   g_trapExtremoArmadilha = 0.0;
-   g_trapPendingBars      = 0;
-   g_trapPositionTicket   = 0;
+   int swing   = InpSR_SwingBars;
+   int bars    = Bars(_Symbol, InpTimeFrame);
+   int maxScan = InpSR_Lookback;
+
+   if(maxScan > bars - swing - 2)
+      maxScan = bars - swing - 2;
+
+   if(maxScan < swing + 1)
+      return(0);
+
+   int need = maxScan + swing + 1;
+   if(need > bars)
+      need = bars;
+
+   MqlRates r[];
+   ArraySetAsSeries(r, true);
+   if(CopyRates(_Symbol, InpTimeFrame, 0, need, r) != need)
+      return(0);
+
+   double spacing = InpSR_MinLevelSpacingPips * SR_PipSize();
+
+//--- Varre a janela inteira (mais recente -> mais antigo)
+   for(int i = swing + 1; i <= maxScan; i++)
+     {
+      //--- TOPO (Resistência)
+      bool topo = true;
+      for(int k = 1; k <= swing; k++)
+        {
+         if(r[i].high <= r[i - k].high || r[i].high <= r[i + k].high)
+           {
+            topo = false;
+            break;
+           }
+        }
+
+      if(topo && !SR_NivelDuplicado(r[i].high, true, spacing))
+        {
+         int idx = ArraySize(g_srLevels);
+         ArrayResize(g_srLevels, idx + 1);
+         g_srLevels[idx].price        = r[i].high;
+         g_srLevels[idx].shift        = i;
+         g_srLevels[idx].time         = r[i].time;
+         g_srLevels[idx].isResistance = true;
+         g_srLevels[idx].active       = true;
+        }
+
+      //--- FUNDO (Suporte)
+      bool fundo = true;
+      for(int k = 1; k <= swing; k++)
+        {
+         if(r[i].low >= r[i - k].low || r[i].low >= r[i + k].low)
+           {
+            fundo = false;
+            break;
+           }
+        }
+
+      if(fundo && !SR_NivelDuplicado(r[i].low, false, spacing))
+        {
+         int idx = ArraySize(g_srLevels);
+         ArrayResize(g_srLevels, idx + 1);
+         g_srLevels[idx].price        = r[i].low;
+         g_srLevels[idx].shift        = i;
+         g_srLevels[idx].time         = r[i].time;
+         g_srLevels[idx].isResistance = false;
+         g_srLevels[idx].active       = true;
+        }
+     }
+
+   return(ArraySize(g_srLevels));
   }
 
 //+------------------------------------------------------------------+
-//| Avalia a armadilha (Raio X / VSA) no fechamento da vela 1.        |
-//| Detecta a rejeição + captura de liquidez + volume e ARMA a ordem  |
-//| STOP. Não retorna sinal a mercado (execução via Trap_Manage).     |
+//| Média móvel simples do volume das velas fechadas anteriores.      |
 //+------------------------------------------------------------------+
-ENUM_ALPHA_SIGNAL CheckTrapSignal()
+double SR_VolumeMedio()
   {
-//--- Autocontido: só mapeia liquidez quando o ciclo está em IDLE
-   if(g_trapEstado != TRAP_STATE_IDLE)
-      return(SIGNAL_NONE);
+   double soma = 0.0;
+   for(int i = 2; i <= 1 + InpSR_VolMAPeriod; i++)
+      soma += (double)iVolume(_Symbol, InpTimeFrame, i);
 
-   if(InpTrapLookback < 2 || InpTrapVolMAPeriod < 2)
-      return(SIGNAL_NONE);
+   return(soma / (double)InpSR_VolMAPeriod);
+  }
 
-//--- Avalia apenas UMA vez por candle fechado (evita reavaliação por tick)
-   datetime barraSinal = iTime(_Symbol, InpTimeFrame, 1);
-   if(barraSinal == 0 || barraSinal == g_trapUltimaBarraAvaliada)
-      return(SIGNAL_NONE);
-   g_trapUltimaBarraAvaliada = barraSinal;
+//+------------------------------------------------------------------+
+//| Valida o filtro de volume da vela 1 (se ativado).                  |
+//+------------------------------------------------------------------+
+bool SR_VolumeValido()
+  {
+   if(!InpSR_UseVolume)
+      return(true);
 
-//--- Barras suficientes para suporte/resistência + média de volume
-   if(Bars(_Symbol, InpTimeFrame) < InpTrapLookback + InpTrapVolMAPeriod + 3)
-      return(SIGNAL_NONE);
-
-//--- A) Níveis de liquidez: menor mínima e maior máxima (i = 2 .. 1 + lookback)
-   int shiftHigh = iHighest(_Symbol, InpTimeFrame, MODE_HIGH, InpTrapLookback, 2);
-   int shiftLow  = iLowest(_Symbol, InpTimeFrame, MODE_LOW, InpTrapLookback, 2);
-   if(shiftHigh < 0 || shiftLow < 0)
-      return(SIGNAL_NONE);
-
-   double resistanceLevel = iHigh(_Symbol, InpTimeFrame, shiftHigh);
-   double supportLevel    = iLow(_Symbol, InpTimeFrame, shiftLow);
-
-//--- B) Média móvel simples do volume (i = 2 .. 1 + InpTrapVolMAPeriod)
-   double volSum = 0.0;
-   for(int i = 2; i <= 1 + InpTrapVolMAPeriod; i++)
-      volSum += (double)iVolume(_Symbol, InpTimeFrame, i);
-
-   double volMA = volSum / (double)InpTrapVolMAPeriod;
-   if(volMA <= 0.0)
-      return(SIGNAL_NONE);
+   double media = SR_VolumeMedio();
+   if(media <= 0.0)
+      return(false);
 
    double vol1 = (double)iVolume(_Symbol, InpTimeFrame, 1);
-   if(vol1 < volMA * InpTrapVolMultiplier)
-      return(SIGNAL_NONE);
+   return(vol1 >= media * InpSR_VolMultiplier);
+  }
 
-//--- Dados da vela de sinal
-   double low1   = iLow(_Symbol, InpTimeFrame, 1);
-   double high1  = iHigh(_Symbol, InpTimeFrame, 1);
-   double open1  = iOpen(_Symbol, InpTimeFrame, 1);
-   double close1 = iClose(_Symbol, InpTimeFrame, 1);
+//+------------------------------------------------------------------+
+//| Conta os TOQUES históricos na região de preço do nível: vela cuja |
+//| faixa [low; high] intersecta [nível - tol ; nível + tol]. Exclui a |
+//| vela 1 (teste corrente) e a janela de FORMAÇÃO do fractal          |
+//| (shiftFractal ± InpSR_SwingBars), evitando contar a própria       |
+//| origem do nível como se fosse uma revisita.                        |
+//+------------------------------------------------------------------+
+int SR_ContarToques(const double nivel, const int shiftFractal)
+  {
+   if(nivel <= 0.0)
+      return(0);
 
-   double range1 = high1 - low1;
-   if(range1 <= 0.0)
-      return(SIGNAL_NONE);
+   double tol   = InpSR_TouchTolerancePips * SR_PipSize();
+   int    bars  = Bars(_Symbol, InpTimeFrame);
+   int    limite = InpSR_Lookback;
+   int    swing  = InpSR_SwingBars;
+   int    toques = 0;
 
-   double pip            = TrapPipSize();
-   double buffer         = InpTrapStopBufferPips * pip;
-   double pendingOffset  = InpTrapPendingOffsetPips * pip;
-   double minPenetration = InpTrapMinPenetrationPips * pip;
+   if(limite > bars - 2)
+      limite = bars - 2;
 
-//--- C) COMPRA (Spring / Bear Trap): captura de liquidez + rejeição + volume
-//---    Pavio inferior penetra o suporte; fechamento na metade superior.
-   double lowerWick = MathMin(open1, close1) - low1;
-   bool compraValida = (low1 < supportLevel) &&
-                       (close1 > supportLevel) &&
-                       ((supportLevel - low1) >= minPenetration) &&
-                       (close1 >= low1 + range1 * 0.5) &&
-                       (lowerWick >= range1 * InpTrapMinWickRatio);
-   if(compraValida)
+   for(int i = 2; i <= limite; i++)
      {
-      double entry = NormalizeDouble(high1 + pendingOffset, _Digits);
-      double sl    = NormalizeDouble(low1 - buffer, _Digits);
-      if(entry > sl)
-        {
-         double risco = entry - sl;
-         double tp    = NormalizeDouble(entry + risco * InpTrapRiskReward, _Digits);
-         if(Trap_PlaceStopOrder(1, entry, sl, tp))
-           {
-            g_signalPadrao = "Armadilha Raio X (Spring / Bear Trap)";
-            Print("[ARMADILHA] COMPRA validada (VSA): Pavio inferior penetrou ",
-                  DoubleToString((supportLevel - low1) / pip, 1), " pips | Fechamento (",
-                  DoubleToString(close1, _Digits), ") na metade superior | Volume ",
-                  DoubleToString(vol1, 0), " >= ",
-                  DoubleToString(volMA * InpTrapVolMultiplier, 0), ".");
-           }
-        }
+      //--- Ignora a janela de formação do fractal (origem do nível)
+      if(shiftFractal > 0 && i >= shiftFractal - swing && i <= shiftFractal + swing)
+         continue;
+
+      double low  = iLow(_Symbol, InpTimeFrame, i);
+      double high = iHigh(_Symbol, InpTimeFrame, i);
+
+      if(low <= nivel + tol && high >= nivel - tol)
+         toques++;
+     }
+
+   return(toques);
+  }
+
+//+------------------------------------------------------------------+
+//| PONTUAÇÃO (SCORE) de relevância do nível de S/R.                   |
+//|   Score = Base (fractal válido)                                    |
+//|         + Volume (barra de teste expressiva vs média)              |
+//|         + Toques históricos na mesma região x peso                 |
+//+------------------------------------------------------------------+
+double SR_PontuarNivel(const double nivel, const int shiftFractal,
+                       const bool volumeExpressivo,
+                       int &toques, double &pontosBase, double &pontosVolume,
+                       double &pontosToques)
+  {
+   toques        = SR_ContarToques(nivel, shiftFractal);
+   pontosBase    = InpSR_ScoreBase;
+   pontosVolume  = (InpSR_UseVolume && volumeExpressivo) ? InpSR_ScoreVolume : 0.0;
+   pontosToques  = (double)toques * InpSR_ScoreTouch;
+
+   return(pontosBase + pontosVolume + pontosToques);
+  }
+
+//+------------------------------------------------------------------+
+//| Avalia o teste da zona de S/R e retorna o gatilho da vez.          |
+//| Autocontido: roda apenas no fechamento de candle e mantém o        |
+//| mapeamento vivo por até InpSR_MaxBarsWait velas sem gatilho.       |
+//+------------------------------------------------------------------+
+ENUM_ALPHA_SIGNAL CheckSRSignal()
+  {
+   if(InpSR_SwingBars < 1 || InpSR_Lookback < InpSR_SwingBars + 1)
+      return(SIGNAL_NONE);
+
+//--- Avalia apenas UMA vez por candle fechado
+   datetime barraSinal = iTime(_Symbol, InpTimeFrame, 1);
+   if(barraSinal == 0 || barraSinal == g_srUltimaBarraAvaliada)
+      return(SIGNAL_NONE);
+   g_srUltimaBarraAvaliada = barraSinal;
+
+//--- Barras suficientes para o mapeamento (e para a média de volume, se usada)
+   int barrasNecessarias = InpSR_Lookback + 3;
+   if(InpSR_UseScore && InpSR_UseVolume)
+      barrasNecessarias = InpSR_Lookback + InpSR_VolMAPeriod + 3;
+
+   if(Bars(_Symbol, InpTimeFrame) < barrasNecessarias)
+     {
+      Print("[S/R] Avaliação abortada: barras insuficientes (",
+            Bars(_Symbol, InpTimeFrame), ") para o Lookback ", InpSR_Lookback, ".");
       return(SIGNAL_NONE);
      }
 
-//--- D) VENDA (Upthrust / Bull Trap): captura de liquidez + rejeição + volume
-//---    Pavio superior penetra a resistência; fechamento na metade inferior.
-   double upperWick = high1 - MathMax(open1, close1);
-   bool vendaValida = (high1 > resistanceLevel) &&
-                      (close1 < resistanceLevel) &&
-                      ((high1 - resistanceLevel) >= minPenetration) &&
-                      (close1 <= low1 + range1 * 0.5) &&
-                      (upperWick >= range1 * InpTrapMinWickRatio);
-   if(vendaValida)
+//--- Estado do sinal é renovado a cada candle avaliado
+   g_srAtivo = false;
+
+//--- (Re)mapeia TODOS os níveis da janela quando necessário
+   if(!g_srMapeado || g_srBarrasSemGatilho > InpSR_MaxBarsWait)
      {
-      double entry = NormalizeDouble(low1 - pendingOffset, _Digits);
-      double sl    = NormalizeDouble(high1 + buffer, _Digits);
-      if(sl > entry)
+      int total = SR_MapearNiveis();
+      if(total <= 0)
         {
-         double risco = sl - entry;
-         double tp    = NormalizeDouble(entry - risco * InpTrapRiskReward, _Digits);
-         if(Trap_PlaceStopOrder(-1, entry, sl, tp))
+         Print("[S/R] Mapeamento não encontrou topos/fundos válidos (swing=",
+               InpSR_SwingBars, " | lookback=", InpSR_Lookback, ").");
+         return(SIGNAL_NONE);
+        }
+
+      g_srMapeado          = true;
+      g_srBarrasSemGatilho = 0;
+
+      int nRes = 0, nSup = 0;
+      for(int i = 0; i < total; i++)
+        {
+         if(g_srLevels[i].isResistance)
+            nRes++;
+         else
+            nSup++;
+        }
+
+      Print("[S/R] Multi-nível (re)mapeado: ", total, " níveis (",
+            nSup, " suportes | ", nRes, " resistências) | swing=",
+            InpSR_SwingBars, " | lookback=", InpSR_Lookback,
+            " | espaçamento mín=", DoubleToString(InpSR_MinLevelSpacingPips, 2), " pips.");
+     }
+   else
+      g_srBarrasSemGatilho++;
+
+//--- Representação gráfica das zonas (um retângulo por nível ativo)
+   SR_UpdateVisuals();
+
+   double pip   = SR_PipSize();
+   double zona  = InpSR_ZonePips * pip;
+   double low1  = iLow(_Symbol, InpTimeFrame, 1);
+   double high1 = iHigh(_Symbol, InpTimeFrame, 1);
+   double bid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+//--- Monta a lista de candidatos ATIVOS cuja zona foi tocada pela vela[1]
+   int    candidatos[];
+   double distancias[];
+   ArrayResize(candidatos, 0);
+   ArrayResize(distancias, 0);
+
+   int ativos = 0;
+   for(int i = 0; i < ArraySize(g_srLevels); i++)
+     {
+      if(!g_srLevels[i].active)
+         continue;
+
+      ativos++;
+
+      double nivel = g_srLevels[i].price;
+      bool   testou;
+      double distAtual;
+
+      if(g_srLevels[i].isResistance)
+        {
+         testou    = (high1 >= nivel - zona && low1 <= nivel + zona);
+         distAtual = MathAbs(ask - nivel);
+        }
+      else
+        {
+         testou    = (low1 <= nivel + zona && high1 >= nivel - zona);
+         distAtual = MathAbs(bid - nivel);
+        }
+
+      if(!testou)
+         continue;
+
+      int c = ArraySize(candidatos);
+      ArrayResize(candidatos, c + 1);
+      ArrayResize(distancias, c + 1);
+      candidatos[c] = i;
+      distancias[c] = distAtual;
+     }
+
+//--- AUDITORIA multi-nível: transparência total a cada candle avaliado
+   Print("[S/R] Auditoria candle[1] | Bid=", DoubleToString(bid, _Digits),
+         " | Ask=", DoubleToString(ask, _Digits),
+         " | Vela[1] Low=", DoubleToString(low1, _Digits),
+         " High=", DoubleToString(high1, _Digits),
+         " | Níveis ativos=", ativos,
+         " | Zonas tocadas=", ArraySize(candidatos),
+         " | Zona=", DoubleToString(InpSR_ZonePips, 2), " pips",
+         " | Score=", (InpSR_UseScore ? "ON" : "OFF"), ".");
+
+   if(ArraySize(candidatos) == 0)
+      return(SIGNAL_NONE);
+
+//--- Ordena os candidatos por proximidade do preço atual (mais perto primeiro)
+   for(int a = 1; a < ArraySize(candidatos); a++)
+     {
+      int    idxA  = candidatos[a];
+      double distA = distancias[a];
+      int    b     = a - 1;
+
+      while(b >= 0 && distancias[b] > distA)
+        {
+         candidatos[b + 1] = candidatos[b];
+         distancias[b + 1] = distancias[b];
+         b--;
+        }
+
+      candidatos[b + 1] = idxA;
+      distancias[b + 1] = distA;
+     }
+
+//--- Avalia cada candidato (mais próximo primeiro). O 1º que passar dispara.
+   bool volumeExpressivo = InpSR_UseScore ? SR_VolumeValido() : false;
+
+   for(int c = 0; c < ArraySize(candidatos); c++)
+     {
+      int    idx   = candidatos[c];
+      double nivel = g_srLevels[idx].price;
+      int    dir   = g_srLevels[idx].isResistance ? -1 : 1;
+      double distP = distancias[c] / pip;
+
+      int    toques = 0;
+      double pBase = 0.0, pVol = 0.0, pToque = 0.0;
+      double score = 0.0;
+
+      if(InpSR_UseScore)
+        {
+         score = SR_PontuarNivel(nivel, g_srLevels[idx].shift, volumeExpressivo,
+                                 toques, pBase, pVol, pToque);
+
+         if(score < InpSR_MinScoreRequired)
            {
-            g_signalPadrao = "Armadilha Raio X (Upthrust / Bull Trap)";
-            Print("[ARMADILHA] VENDA validada (VSA): Pavio superior penetrou ",
-                  DoubleToString((high1 - resistanceLevel) / pip, 1), " pips | Fechamento (",
-                  DoubleToString(close1, _Digits), ") na metade inferior | Volume ",
-                  DoubleToString(vol1, 0), " >= ",
-                  DoubleToString(volMA * InpTrapVolMultiplier, 0), ".");
+            Print("[S/R] ", (dir == 1 ? "COMPRA" : "VENDA"),
+                  " REJEITADA [Score] no nível ", DoubleToString(nivel, _Digits),
+                  ": ", DoubleToString(score, 2), " < mínimo ",
+                  DoubleToString(InpSR_MinScoreRequired, 2),
+                  " (base=", DoubleToString(pBase, 2),
+                  " + volume=", DoubleToString(pVol, 2),
+                  " + toques=", DoubleToString(pToque, 2), " [", toques, "]).");
+            continue;
            }
         }
-      return(SIGNAL_NONE);
+
+      //--- Nível validado: arma o sinal e consome o nível (active=false)
+      g_srAtivo      = true;
+      g_srDirecao    = dir;
+      g_srNivel      = nivel;
+      g_srLevels[idx].active = false;
+      g_signalPadrao = (dir == 1)
+                       ? "Suporte e Resistência (Teste de Suporte)"
+                       : "Suporte e Resistência (Teste de Resistência)";
+
+      double sl = (dir == 1)
+                  ? NormalizeDouble(nivel - InpSR_StopBufferPips * pip, _Digits)
+                  : NormalizeDouble(nivel + InpSR_StopBufferPips * pip, _Digits);
+
+      Print("[S/R] ", (dir == 1 ? "COMPRA" : "VENDA"), " VALIDADA: Nível=",
+            DoubleToString(nivel, _Digits),
+            " (", (dir == 1 ? "Suporte" : "Resistência"), ")",
+            " | preço atual=", DoubleToString(dir == 1 ? bid : ask, _Digits),
+            " | distância=", DoubleToString(distP, 2), " pips",
+            " | zona=", DoubleToString(InpSR_ZonePips, 2), " pips",
+            " | score=", (InpSR_UseScore ? DoubleToString(score, 2) : "OFF"),
+            " | SL=", DoubleToString(sl, _Digits),
+            " | TP.RR=", DoubleToString(InpSR_RiskReward, 2), ".");
+
+      return(dir == 1 ? SIGNAL_BUY : SIGNAL_SELL);
      }
 
    return(SIGNAL_NONE);
-  }
-
-//+------------------------------------------------------------------+
-//| MÁQUINA DE ESTADOS DA ARMADILHA (chamada a cada tick no OnTick).  |
-//| Gerencia a ordem STOP pendente: ativação, expiração e invalidação.|
-//+------------------------------------------------------------------+
-void Trap_Manage()
-  {
-   if(InpTrapLookback < 2 || InpTrapVolMAPeriod < 2)
-      return;
-
-   bool temPosicao  = Trap_ExistePosicao();
-   bool temPendente = Trap_OrdemPendenteViva();
-
-//--- ESTADO EM_TRADE: posição aberta; SL/TP nativos conduzem o desfecho
-   if(g_trapEstado == TRAP_STATE_EM_TRADE)
-     {
-      if(temPosicao)
-         return;
-
-      Trap_ResetCiclo("Posição encerrada (TP/SL)");
-      Print("[ARMADILHA] Ciclo encerrado. Voltando a mapear liquidez (IDLE).");
-      return;
-     }
-
-//--- ESTADO ARMADA: ordem STOP viva aguardando o rompimento do extremo
-   if(g_trapEstado == TRAP_STATE_ARMADA)
-     {
-      //--- Ordem ativada: deixou de ser pendente e virou posição
-      if(!temPendente && temPosicao)
-        {
-         g_trapEstado = TRAP_STATE_EM_TRADE;
-         Print("[ARMADILHA] Ordem STOP ativada! Posição aberta | ticket=",
-               g_trapPositionTicket, " | SL=", DoubleToString(g_trapStopLoss, _Digits),
-               " | TP=", DoubleToString(g_trapTakeProfit, _Digits), ".");
-         return;
-        }
-
-      //--- Ordem sumiu sem gerar posição (cancelada externamente)
-      if(!temPendente && !temPosicao)
-        {
-         Trap_ResetCiclo("Ordem pendente removida externamente");
-         return;
-        }
-
-      //--- Avaliação 1x por candle fechado: expiração / invalidação
-      datetime barraFechada = iTime(_Symbol, InpTimeFrame, 1);
-      if(barraFechada != 0 && barraFechada != g_trapUltimaBarraAvaliada)
-        {
-         g_trapUltimaBarraAvaliada = barraFechada;
-         g_trapPendingBars++;
-
-         if(InpTrapMaxBarsPendent > 0 && g_trapPendingBars > InpTrapMaxBarsPendent)
-           {
-            Trap_ResetCiclo("Ordem STOP expirada (" +
-                            IntegerToString(g_trapPendingBars) + " velas)");
-            Print("[ARMADILHA] Ordem STOP expirada. Voltando a mapear liquidez (IDLE).");
-            return;
-           }
-
-         MqlRates r[];
-         ArraySetAsSeries(r, true);
-         if(CopyRates(_Symbol, InpTimeFrame, 0, 2, r) == 2)
-           {
-            bool invalidou = ((g_trapDirecao == 1  && r[1].close < g_trapExtremoArmadilha) ||
-                              (g_trapDirecao == -1 && r[1].close > g_trapExtremoArmadilha));
-            if(invalidou)
-              {
-               Print("[ARMADILHA] Setup invalidado: fechamento rompeu o extremo da vela "
-                     "armadilha (", DoubleToString(g_trapExtremoArmadilha, _Digits), ").");
-               Trap_ResetCiclo("Setup invalidado");
-               return;
-              }
-           }
-        }
-     }
   }
 
 //+==================================================================+
@@ -2398,7 +2642,7 @@ void SMC_Manage()
 //| Encaminha para o motor escolhido no painel de inputs:             |
 //|   SIGNAL_CANDLE_PATTERNS -> Padrões de Candle (Engolfo/Martelo)   |
 //|   SIGNAL_FIMATHE         -> Metodologia Fimathe (CR + ZN)         |
-//|   SIGNAL_TRAP            -> Armadilha de Raio X (autocontida no OnTick) |
+//|   SIGNAL_SR              -> Suporte e Resistência (teste de zona) |
 //|   SIGNAL_SMC             -> SMC (tratado à parte no OnTick)       |
 //+------------------------------------------------------------------+
 ENUM_ALPHA_SIGNAL CheckEntrySignal()
@@ -2406,10 +2650,8 @@ ENUM_ALPHA_SIGNAL CheckEntrySignal()
    if(InpSignalType == SIGNAL_FIMATHE)
       return(CheckFimatheSignal());
 
-//--- A Armadilha é autocontida (arma a ordem STOP via CheckTrapSignal e a
-//--- gerencia via Trap_Manage, no OnTick). Não usa entrada a mercado aqui.
-   if(InpSignalType == SIGNAL_TRAP)
-      return(SIGNAL_NONE);
+   if(InpSignalType == SIGNAL_SR)
+      return(CheckSRSignal());
 
    return(CheckPriceActionSignal());
   }
@@ -2778,19 +3020,18 @@ double GL_NormalizarLote(double lote)
   }
 
 //+------------------------------------------------------------------+
-//| Verifica se um Magic pertence a este robô (qualquer perna).       |
+//| Verifica se um Magic pertence a este robô.                        |
+//| Magic Number ÚNICO: basta comparar com InpMagicNumber.             |
 //+------------------------------------------------------------------+
 bool GL_MagicPertenceAoRobo(const long magic)
   {
-   return(magic == InpMagicNumber ||
-          magic == InpMagicGL     ||
-          magic == InpMagicGLBuy  ||
-          magic == InpMagicGLSell);
+   return(magic == InpMagicNumber);
   }
 
 //+------------------------------------------------------------------+
 //| Localiza o ticket da posição principal (âncora) desta perna.      |
-//| Filtra por Magic E por direção, separando compra de venda.        |
+//| Magic único: filtra por InpMagicNumber E pela direção da perna,    |
+//| separando compra de venda.                                         |
 //+------------------------------------------------------------------+
 ulong GL_TicketAncora(CGLGrid &st)
   {
@@ -2803,7 +3044,7 @@ ulong GL_TicketAncora(CGLGrid &st)
       if(PositionGetString(POSITION_SYMBOL) != _Symbol)
          continue;
 
-      if((long)PositionGetInteger(POSITION_MAGIC) != st.magicAncora)
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
          continue;
 
       ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
@@ -2820,7 +3061,8 @@ ulong GL_TicketAncora(CGLGrid &st)
 
 //+------------------------------------------------------------------+
 //| Localiza o ticket da sub-operação recém-aberta nesta perna.       |
-//| Filtra pelo Magic exclusivo da perna para não misturar reentradas.|
+//| Magic único: filtra por InpMagicNumber + direção e ignora os       |
+//| tickets já mapeados nos níveis da perna (inclusive a âncora).      |
 //+------------------------------------------------------------------+
 ulong GL_TicketRecemAberto(CGLGrid &st)
   {
@@ -2835,7 +3077,7 @@ ulong GL_TicketRecemAberto(CGLGrid &st)
       if(PositionGetString(POSITION_SYMBOL) != _Symbol)
          continue;
 
-      if((long)PositionGetInteger(POSITION_MAGIC) != st.magicSub)
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
          continue;
 
       ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
@@ -2861,7 +3103,8 @@ ulong GL_TicketRecemAberto(CGLGrid &st)
 
 //+------------------------------------------------------------------+
 //| Verifica se ainda existe alguma posição ativa desta perna.        |
-//| Considera a âncora (mesma direção) e as reentradas (Magic da perna)|
+//| Magic único: qualquer posição do robô (InpMagicNumber) na direção  |
+//| da perna pertence a ela (âncora ou reentrada).                     |
 //+------------------------------------------------------------------+
 bool GL_ExistePosicaoAtiva(CGLGrid &st)
   {
@@ -2874,18 +3117,13 @@ bool GL_ExistePosicaoAtiva(CGLGrid &st)
       if(PositionGetString(POSITION_SYMBOL) != _Symbol)
          continue;
 
-      long magic = (long)PositionGetInteger(POSITION_MAGIC);
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
 
-      if(magic == st.magicSub)
+      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if((st.direcao == 1 && tipo == POSITION_TYPE_BUY) ||
+         (st.direcao == -1 && tipo == POSITION_TYPE_SELL))
          return(true);
-
-      if(magic == st.magicAncora)
-        {
-         ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-         if((st.direcao == 1 && tipo == POSITION_TYPE_BUY) ||
-            (st.direcao == -1 && tipo == POSITION_TYPE_SELL))
-            return(true);
-        }
      }
 
    return(false);
@@ -3037,7 +3275,7 @@ void CalculateGLLevels(CGLGrid &st, const double precoEntrada, const int direcao
    Print("AlphaBot GL - Global SL: ", DoubleToString(st.globalSL, _Digits),
          " | Global TP: ", DoubleToString(st.globalTP, _Digits),
          " | Lote: ", DoubleToString(InpLoteInicial, 2),
-         " | MagicSub: ", st.magicSub,
+         " | Magic: ", InpMagicNumber,
          " | Âncora: ", ticketAncora, ".");
 
 //--- Verificação de espelhamento: na COMPRA o TP fica ACIMA e o drawdown ABAIXO;
@@ -3051,7 +3289,7 @@ void CalculateGLLevels(CGLGrid &st, const double precoEntrada, const int direcao
 //+==================================================================+
 //| MÓDULO DE GESTÃO: AUTO-ATACHAMENTO DO GRADIENTE LINEAR            |
 //| Intercepta QUALQUER posição principal aberta (Magic InpMagicNumber)|
-//| por QUALQUER estratégia (SMC, Fimathe, Armadilha, Price Action) e  |
+//| por QUALQUER estratégia (SMC, Fimathe, S/R, Price Action) e       |
 //| assume o controle, pendurando a grade sobre o SL/TP reais da ordem.|
 //+==================================================================+
 bool GL_AutoAttachUnidirectional()
@@ -3151,14 +3389,12 @@ double GL_PrecoMedioPonderado(CGLGrid &st, double &volumeTotal,
       if(PositionGetString(POSITION_SYMBOL) != _Symbol)
          continue;
 
-      long magic = (long)PositionGetInteger(POSITION_MAGIC);
-      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
 
-      bool pertence = (magic == st.magicSub) ||
-                      (magic == st.magicAncora &&
-                       ((st.direcao == 1 && tipo == POSITION_TYPE_BUY) ||
-                        (st.direcao == -1 && tipo == POSITION_TYPE_SELL)));
-      if(!pertence)
+      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if(!((st.direcao == 1 && tipo == POSITION_TYPE_BUY) ||
+           (st.direcao == -1 && tipo == POSITION_TYPE_SELL)))
          continue;
 
       double vol = PositionGetDouble(POSITION_VOLUME);
@@ -3206,14 +3442,12 @@ void GL_DesligarTPsDaPerna(CGLGrid &st)
       if(PositionGetString(POSITION_SYMBOL) != _Symbol)
          continue;
 
-      long magic = (long)PositionGetInteger(POSITION_MAGIC);
-      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
 
-      bool pertence = (magic == st.magicSub) ||
-                      (magic == st.magicAncora &&
-                       ((st.direcao == 1 && tipo == POSITION_TYPE_BUY) ||
-                        (st.direcao == -1 && tipo == POSITION_TYPE_SELL)));
-      if(!pertence)
+      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if(!((st.direcao == 1 && tipo == POSITION_TYPE_BUY) ||
+           (st.direcao == -1 && tipo == POSITION_TYPE_SELL)))
          continue;
 
       if(PositionGetDouble(POSITION_TP) <= 0.0)
@@ -3221,7 +3455,7 @@ void GL_DesligarTPsDaPerna(CGLGrid &st)
 
       double sl = PositionGetDouble(POSITION_SL);
 
-      trade.SetExpertMagicNumber(magic);
+      trade.SetExpertMagicNumber(InpMagicNumber);
       if(!trade.PositionModify(ticket, sl, 0.0))
          Print("AlphaBot GL - AVISO: falha ao desligar TP do ticket ", ticket,
                " (retcode=", trade.ResultRetcode(),
@@ -3297,8 +3531,8 @@ bool GL_OpenPosition(CGLGrid &st, const int offset, const bool positivo = false)
                        " Nivel " + IntegerToString(offset) +
                        (piramidar ? " Piramide" : "");
 
-//--- Usa SEMPRE o Magic exclusivo da perna nas reentradas
-   trade.SetExpertMagicNumber(st.magicSub);
+//--- Magic Number ÚNICO: reentradas usam o mesmo InpMagicNumber
+   trade.SetExpertMagicNumber(InpMagicNumber);
 
    bool ok = false;
    if(st.direcao == 1)
@@ -3539,21 +3773,13 @@ void CloseLegPositions(CGLGrid &st, const string motivo = "")
       if(PositionGetString(POSITION_SYMBOL) != _Symbol)
          continue;
 
-      long magic = (long)PositionGetInteger(POSITION_MAGIC);
-      bool pertence = false;
+      if((long)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
 
-      if(magic == st.magicSub)
-         pertence = true;
-      else
-         if(magic == st.magicAncora)
-           {
-            ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-            if((st.direcao == 1 && tipo == POSITION_TYPE_BUY) ||
-               (st.direcao == -1 && tipo == POSITION_TYPE_SELL))
-               pertence = true;
-           }
-
-      if(!pertence)
+//--- Magic único: a perna é identificada pela direção da posição
+      ENUM_POSITION_TYPE tipo = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if(!((st.direcao == 1 && tipo == POSITION_TYPE_BUY) ||
+           (st.direcao == -1 && tipo == POSITION_TYPE_SELL)))
          continue;
 
       if(trade.PositionClose(ticket))
@@ -3721,7 +3947,7 @@ bool GL_ReSeedLeg(CGLGrid &st, const int direcao)
       tp = NormalizeDouble(preco - distTP, _Digits);
      }
 
-   trade.SetExpertMagicNumber(st.magicSub);
+   trade.SetExpertMagicNumber(InpMagicNumber);
 
    bool ok = false;
    if(direcao == 1)
@@ -3977,20 +4203,21 @@ void ExecuteBuy()
    double sl = 0.0;
    double tp = 0.0;
 
-//--- SL/TP específicos da Armadilha de Liquidez (baseados no pavio + R:R)
-   if(g_trapAtivo)
+//--- SL/TP específicos do Motor S/R: stop com folga além do suporte mapeado
+   if(g_srAtivo && g_srDirecao == 1)
      {
-      sl = NormalizeDouble(g_trapStopLoss, _Digits);
+      sl = NormalizeDouble(g_srNivel - InpSR_StopBufferPips * SR_PipSize(), _Digits);
       double risco = precoEntrada - sl;
       if(risco <= 0.0)
         {
-         Print("AlphaBot - ERRO [ARMADILHA]: distância de risco inválida para COMPRA (SL=",
+         Print("AlphaBot - ERRO [S/R]: distância de risco inválida para COMPRA (Suporte=",
+               DoubleToString(g_srNivel, _Digits), " | SL=",
                DoubleToString(sl, _Digits), " | Ask=",
                DoubleToString(precoEntrada, _Digits), "). Ordem abortada.");
-         g_trapAtivo = false;
+         g_srAtivo = false;
          return;
         }
-       tp = NormalizeDouble(precoEntrada + risco * InpTrapRiskReward, _Digits);
+       tp = NormalizeDouble(precoEntrada + risco * InpSR_RiskReward, _Digits);
       }
    else
      {
@@ -4030,9 +4257,11 @@ void ExecuteBuy()
             ") | Erro: ", GetLastError());
      }
 
-//--- Consome o sinal da Armadilha (usado apenas uma vez)
-   g_trapAtivo = false;
-  }
+//--- Consome o sinal S/R (usado apenas uma vez)
+   g_srAtivo   = false;
+   g_srDirecao = 0;
+   g_srNivel   = 0.0;
+   }
 
 //+------------------------------------------------------------------+
 //| Executa ordem de VENDA (Martelo Invertido / Engolfo de Baixa).   |
@@ -4043,20 +4272,21 @@ void ExecuteSell()
    double sl = 0.0;
    double tp = 0.0;
 
-//--- SL/TP específicos da Armadilha de Liquidez (baseados no pavio + R:R)
-   if(g_trapAtivo)
+//--- SL/TP específicos do Motor S/R: stop com folga além da resistência mapeada
+   if(g_srAtivo && g_srDirecao == -1)
      {
-      sl = NormalizeDouble(g_trapStopLoss, _Digits);
+      sl = NormalizeDouble(g_srNivel + InpSR_StopBufferPips * SR_PipSize(), _Digits);
       double risco = sl - precoEntrada;
       if(risco <= 0.0)
         {
-         Print("AlphaBot - ERRO [ARMADILHA]: distância de risco inválida para VENDA (SL=",
+         Print("AlphaBot - ERRO [S/R]: distância de risco inválida para VENDA (Resistência=",
+               DoubleToString(g_srNivel, _Digits), " | SL=",
                DoubleToString(sl, _Digits), " | Bid=",
                DoubleToString(precoEntrada, _Digits), "). Ordem abortada.");
-         g_trapAtivo = false;
+         g_srAtivo = false;
          return;
         }
-       tp = NormalizeDouble(precoEntrada - risco * InpTrapRiskReward, _Digits);
+       tp = NormalizeDouble(precoEntrada - risco * InpSR_RiskReward, _Digits);
       }
    else
      {
@@ -4096,9 +4326,11 @@ void ExecuteSell()
             ") | Erro: ", GetLastError());
      }
 
-//--- Consome o sinal da Armadilha (usado apenas uma vez)
-   g_trapAtivo = false;
-  }
+//--- Consome o sinal S/R (usado apenas uma vez)
+   g_srAtivo   = false;
+   g_srDirecao = 0;
+   g_srNivel   = 0.0;
+   }
 
 //+------------------------------------------------------------------+
 //| Existe alguma posição aberta deste robô com o Magic informado?    |
@@ -4160,7 +4392,7 @@ bool EnviarPernaHedge(const ENUM_ORDER_TYPE tipo, const long magic,
 //| GRID BIDIRECIONAL COM HEDGE                                       |
 //| Abre simultaneamente UMA COMPRA e UMA VENDA a mercado, ambas com  |
 //| o mesmo preço base, e ativa o Gradiente Linear espelhado em cada  |
-//| perna (cada uma com seu Magic exclusivo).                         |
+//| perna (todas sob o Magic Number ÚNICO).                           |
 //+------------------------------------------------------------------+
 void ExecuteBidirectionalEntry()
   {
@@ -4173,11 +4405,6 @@ void ExecuteBidirectionalEntry()
             DoubleToString(ask, _Digits), " | Bid=", DoubleToString(bid, _Digits), ").");
       return;
      }
-
-//--- Restaura os Magics padrão das pernas (caso uma sessão anterior tenha
-//--- sido interceptada por uma posição de estratégia com outro Magic)
-   g_glBuy.DefinirMagics(InpMagicGLBuy, InpMagicGLBuy);
-   g_glSell.DefinirMagics(InpMagicGLSell, InpMagicGLSell);
 
 //--- Preço base comum às duas pernas do Gradiente Linear (grade virtual)
    double precoBase = NormalizeDouble((ask + bid) / 2.0, _Digits);
@@ -4196,13 +4423,13 @@ void ExecuteBidirectionalEntry()
          " | TP Venda ", DoubleToString(tpVenda, _Digits),
          " / SL Venda ", DoubleToString(slVenda, _Digits));
 
-//--- Perna de COMPRA (Magic próprio: InpMagicGLBuy)
-   bool okCompra = EnviarPernaHedge(ORDER_TYPE_BUY, InpMagicGLBuy,
-                                    slCompra, tpCompra, "AlphaBot Hedge Compra");
+//--- Perna de COMPRA (Magic Number ÚNICO)
+   bool okCompra = EnviarPernaHedge(ORDER_TYPE_BUY, InpMagicNumber,
+                                     slCompra, tpCompra, "AlphaBot Hedge Compra");
 
-//--- Perna de VENDA (Magic próprio: InpMagicGLSell)
-   bool okVenda = EnviarPernaHedge(ORDER_TYPE_SELL, InpMagicGLSell,
-                                   slVenda, tpVenda, "AlphaBot Hedge Venda");
+//--- Perna de VENDA (Magic Number ÚNICO)
+   bool okVenda = EnviarPernaHedge(ORDER_TYPE_SELL, InpMagicNumber,
+                                    slVenda, tpVenda, "AlphaBot Hedge Venda");
 
 //--- Restaura o Magic padrão das operações normais
    trade.SetExpertMagicNumber(InpMagicNumber);
@@ -4230,7 +4457,7 @@ void ExecuteBidirectionalEntry()
 //+==================================================================+
 //| MÓDULO DE GESTÃO: AUTO-ATACHAMENTO DO GRID BIDIRECIONAL            |
 //| Intercepta uma posição principal já aberta por QUALQUER estratégia |
-//| (SMC, Fimathe, Armadilha, Price Action) e inicia a sessão de hedge:|
+//| (SMC, Fimathe, S/R, Price Action) e inicia a sessão de hedge:      |
 //| abre a perna oposta a mercado e ativa as duas grelhas espelhadas,  |
 //| ambas adaptadas ao SL/TP reais da ordem interceptada.              |
 //+==================================================================+
@@ -4284,8 +4511,8 @@ bool GL_AutoAttachBidirectional()
    Print("[GESTÃO HEDGE] Interceptando posição principal (ticket=", ticketAncora,
          " | ", (direcao == 1 ? "COMPRA" : "VENDA"), "). Iniciando sessão de hedge...");
 
-//--- Perna oposta entra a mercado, com o Magic próprio da perna
-   long   magicOposto = (direcao == 1) ? InpMagicGLSell : InpMagicGLBuy;
+//--- Perna oposta entra a mercado, sob o Magic Number ÚNICO
+   long   magicOposto = InpMagicNumber;
    double precoOposto = (direcao == 1) ? bid : ask;
    double slOposto    = (direcao == 1) ? NormalizeDouble(precoOposto + distSL, _Digits)
                                        : NormalizeDouble(precoOposto - distSL, _Digits);
@@ -4296,20 +4523,16 @@ bool GL_AutoAttachBidirectional()
                                     magicOposto, slOposto, tpOposto,
                                     "AlphaBot Hedge Intercept");
 
-//--- A perna interceptada usa o Magic da estratégia como âncora E nas reentradas
-//--- (grade autoconsistente); a perna oposta usa o Magic próprio da perna.
+//--- Magic Number ÚNICO: as duas pernas (interceptada e oposta) e suas
+//--- reentradas compartilham InpMagicNumber; a separação é pela direção.
    if(direcao == 1)
      {
-      g_glBuy.DefinirMagics(InpMagicNumber, InpMagicNumber);
-      g_glSell.DefinirMagics(InpMagicGLSell, InpMagicGLSell);
       CalculateGLLevels(g_glBuy, precoEntrada, 1, slOrdem, tpOrdem);
       if(okOposto)
          CalculateGLLevels(g_glSell, precoOposto, -1, slOposto, tpOposto);
      }
    else
      {
-      g_glSell.DefinirMagics(InpMagicNumber, InpMagicNumber);
-      g_glBuy.DefinirMagics(InpMagicGLBuy, InpMagicGLBuy);
       CalculateGLLevels(g_glSell, precoEntrada, -1, slOrdem, tpOrdem);
       if(okOposto)
          CalculateGLLevels(g_glBuy, precoOposto, 1, slOposto, tpOposto);
@@ -4506,15 +4729,6 @@ void OnTick()
    if(InpSignalType == SIGNAL_SMC)
      {
       SMC_Manage();
-      return;
-     }
-
-//--- O motor Armadilha (Raio X / VSA) também é autocontido: mapeia a
-//--- liquidez e gerencia a ordem STOP pendente a cada tick.
-   if(InpSignalType == SIGNAL_TRAP)
-     {
-      CheckTrapSignal();
-      Trap_Manage();
       return;
      }
 
